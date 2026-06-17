@@ -1,0 +1,9 @@
+services:
+  voice-agent:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./google_credentials.json:/app/google_credentials.json:ro
+      - ./google_token.json:/app/google_token.json
+    network_mode: host
