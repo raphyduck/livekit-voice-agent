@@ -94,6 +94,12 @@ async def entrypoint(ctx: agents.JobContext):
 
     async def _hangup() -> None:
         try:
+            # Attendre la fin de la parole en cours avant de couper la ligne.
+            try:
+                await session.wait_for_idle()
+            except Exception:  # noqa: BLE001
+                await asyncio.sleep(2.0)
+            await asyncio.sleep(0.3)  # marge réseau dernier paquet audio
             await ctx.api.room.delete_room(api.DeleteRoomRequest(room=ctx.room.name))
         except Exception:  # noqa: BLE001
             logger.exception("Échec du raccrochage automatique")

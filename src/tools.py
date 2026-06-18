@@ -324,8 +324,17 @@ async def end_call() -> str:
     """
     try:
         ctx = get_job_context()
-        # Laisser le dernier TTS se jouer avant de couper la ligne.
-        await asyncio.sleep(0.5)
+        # Attendre que l'agent ait FINI de parler (TTS drainé) avant de couper.
+        session = getattr(ctx, "primary_session", None)
+        if session is not None:
+            try:
+                await session.wait_for_idle()
+            except Exception:  # noqa: BLE001
+                await asyncio.sleep(2.0)  # fallback si wait_for_idle indispo
+        else:
+            await asyncio.sleep(2.0)
+        # petite marge pour la latence réseau du dernier paquet audio
+        await asyncio.sleep(0.3)
         await ctx.api.room.delete_room(api.DeleteRoomRequest(room=ctx.room.name))
         return "Appel terminé."
     except Exception as e:  # noqa: BLE001
