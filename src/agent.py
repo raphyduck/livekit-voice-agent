@@ -6,7 +6,7 @@ import os
 from dotenv import load_dotenv
 
 from livekit import agents, api
-from livekit.agents import Agent, AgentSession, RoomInputOptions, RoomOutputOptions, metrics
+from livekit.agents import Agent, AgentSession, RoomInputOptions, RoomOutputOptions, mcp, metrics
 from livekit.plugins import anthropic, cartesia, deepgram, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
@@ -68,6 +68,35 @@ TOOLS = [
 ]
 
 
+def _build_mcp_servers() -> list:
+    """Serveurs MCP self-hosted attachés UNIQUEMENT pour Raphaël identifié.
+
+    Navigateur (human-browser) + WhatsApp. IMAP reste géré par les outils codés
+    (get_unread_emails/send_email) pour éviter le doublon. Bitwarden est exclu.
+    """
+    servers = []
+    brmcp_url = os.environ.get("BRMCP_URL")
+    brmcp_token = os.environ.get("BRMCP_TOKEN")
+    if brmcp_url and brmcp_token:
+        servers.append(
+            mcp.MCPServerHTTP(
+                url=brmcp_url,
+                headers={"Authorization": f"Bearer {brmcp_token}"},
+                client_session_timeout_seconds=10,
+            )
+        )
+    wa_url = os.environ.get("WA_MCP_URL")
+    if wa_url:
+        # WhatsApp : le secret est déjà dans l'URL, pas de header.
+        servers.append(
+            mcp.MCPServerHTTP(
+                url=wa_url,
+                client_session_timeout_seconds=10,
+            )
+        )
+    return servers
+
+
 async def entrypoint(ctx: agents.JobContext):
     logger.info("Agent démarré pour la room: %s", ctx.room.name)
     await ctx.connect()
@@ -123,6 +152,13 @@ CONTEXTE DE CET APPEL (SORTANT) :
   (type "action") résumant : qui tu as appelé, ce qui a été dit, le résultat obtenu.
 """
 
+    # --- Serveurs MCP self-hosted (gating sécurité) --------------------------
+    # Attachés UNIQUEMENT si l'appelant est identifié comme Raphaël. Appelant
+    # inconnu OU appel sortant (l'appelé n'est pas Raphaël) => aucun serveur MCP,
+    # pour ne jamais exposer ces outils à un tiers.
+    mcp_servers = _build_mcp_servers() if is_raphael() else []
+    logger.info("Serveurs MCP attachés: %d (is_raphael=%s)", len(mcp_servers), is_raphael())
+
     session = AgentSession(
         stt=deepgram.STT(
             model="nova-3",
@@ -152,6 +188,8 @@ CONTEXTE DE CET APPEL (SORTANT) :
         # Laisser le LLM commencer à générer pendant que l'utilisateur finit :
         # gros gain de latence perçue.
         preemptive_generation=True,
+        # Serveurs MCP (navigateur + WhatsApp), uniquement pour Raphaël identifié.
+        mcp_servers=mcp_servers,
     )
 
     await session.start(
