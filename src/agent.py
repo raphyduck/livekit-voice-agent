@@ -75,7 +75,9 @@ async def entrypoint(ctx: agents.JobContext):
             punctuate=True,
         ),
         llm=anthropic.LLM(
-            model="claude-sonnet-4-6",
+            # Modèle configurable via .env (LLM_MODEL). Défaut: Sonnet.
+            # Pour tester Haiku (plus rapide) : LLM_MODEL=claude-haiku-4-5
+            model=os.environ.get("LLM_MODEL", "claude-sonnet-4-6"),
             temperature=0.7,
         ),
         tts=cartesia.TTS(
