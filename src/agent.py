@@ -112,10 +112,12 @@ async def entrypoint(ctx: agents.JobContext):
             await asyncio.sleep(INACTIVITY_TIMEOUT)
         except asyncio.CancelledError:
             return
+        # Ne relancer que si l'agent ne parle pas déjà (sécurité).
         relance_count += 1
         if relance_count == 1:
-            # Le retour en état "listening" ré-armera automatiquement le minuteur.
             await session.say("Vous êtes toujours là ?", allow_interruptions=True)
+            # Réarmer pour laisser une 2e chance APRÈS la relance.
+            _arm_inactivity()
         else:
             await session.say(
                 "Je vais raccrocher, n'hésitez pas à me rappeler. Au revoir.",
@@ -126,7 +128,6 @@ async def entrypoint(ctx: agents.JobContext):
     def _arm_inactivity() -> None:
         nonlocal inactivity_task
         current = asyncio.current_task()
-        # Ne jamais s'auto-annuler : on ignore la tâche courante.
         if inactivity_task and inactivity_task is not current and not inactivity_task.done():
             inactivity_task.cancel()
         inactivity_task = asyncio.create_task(_inactivity_watch())
@@ -138,15 +139,40 @@ async def entrypoint(ctx: agents.JobContext):
             inactivity_task.cancel()
         inactivity_task = None
 
+    # Logique basée UNIQUEMENT sur l'état de l'UTILISATEUR :
+    # - dès qu'il parle (speaking) -> on annule tout (silence rompu, compteur reset)
+    # - quand il arrête (listening) ou s'absente (away) -> on (ré)arme le minuteur
+    # On NE se base PAS sur l'état de l'agent, sinon le minuteur démarre dès que
+    # l'agent finit de parler, avant même que l'utilisateur ait eu le temps de répondre.
     @session.on("user_state_changed")
     def _on_user_state(ev):
-        if getattr(ev, "new_state", None) == "speaking":
+        new = getattr(ev, "new_state", None)
+        if new == "speaking":
             _cancel_inactivity()
+        elif new in ("listening", "away"):
+            # L'utilisateur s'est tu : (re)lancer le décompte de silence.
+            _arm_inactivity()
 
     @session.on("agent_state_changed")
     def _on_agent_state(ev):
-        if getattr(ev, "new_state", None) == "listening":
+        new = getattr(ev, "new_state", None)
+        if new == "speaking":
+            # L'agent parle : ce n'est pas un silence, on suspend le décompte.
+            if inactivity_task and not inactivity_task.done():
+                inactivity_task.cancel()
+        elif new == "listening":
+            # L'agent a fini de parler et attend l'utilisateur : (re)lancer le décompte.
+            # (couvre le cas où l'utilisateur était déjà silencieux, donc aucun
+            #  user_state_changed ne se déclenche après la réponse de l'agent)
             _arm_inactivity()
+
+    @session.on("user_input_transcribed")
+    def _on_user_transcript(ev):
+        # Signal le plus fiable en téléphonie : si du texte est transcrit, l'utilisateur
+        # a bel et bien parlé -> on annule le décompte de silence (et on reset le compteur).
+        text = getattr(ev, "transcript", "") or ""
+        if text.strip():
+            _cancel_inactivity()
 
     # Premier message via session.say() : plus fiable que generate_reply() car il
     # ne dépend pas du LLM et teste directement le chemin TTS → track audio.
