@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 
@@ -67,6 +68,43 @@ async def entrypoint(ctx: agents.JobContext):
     logger.info("Appel entrant de: %s", caller or "inconnu")
     reset_identity(bool(raphael_phone) and caller == raphael_phone)
 
+    # --- Contexte d'appel sortant (metadata JSON portée par la room) ----------
+    # voicecallmcp lance un appel sortant en attachant un metadata
+    # { direction, scenario, objectif, contexte }. On l'utilise pour adapter le
+    # prompt et l'ouverture de l'agent. En entrant, ce metadata est absent.
+    call_ctx = {}
+    try:
+        raw = ctx.room.metadata or ""
+        if raw:
+            call_ctx = json.loads(raw)
+    except Exception:  # noqa: BLE001
+        logger.exception("metadata room illisible")
+
+    is_outbound = call_ctx.get("direction") == "outbound"
+    objectif = call_ctx.get("objectif", "")
+    scenario = call_ctx.get("scenario", "")
+    contexte_appel = call_ctx.get("contexte", "")
+
+    prompt = SYSTEM_PROMPT
+    if is_outbound:
+        consignes = {
+            "rdv": "Tu appelles pour prendre, décaler ou annuler un rendez-vous.",
+            "rappel": "Tu appelles pour transmettre ou obtenir une information.",
+            "message": "Tu appelles pour laisser un message à transmettre.",
+            "relance": "Tu appelles pour relancer sur un sujet en attente.",
+        }.get(scenario, "")
+        prompt = SYSTEM_PROMPT + f"""
+
+CONTEXTE DE CET APPEL (SORTANT) :
+- C'est TOI qui appelles, pas l'inverse. Présente-toi brièvement et explique l'objet de ton appel.
+- {consignes}
+- Objectif précis : {objectif}
+- Informations utiles : {contexte_appel or "aucune"}
+- Mène la conversation vers cet objectif, poliment et efficacement.
+- À la fin de l'appel, AVANT de raccrocher, rédige un compte-rendu concis avec write_journal
+  (type "action") résumant : qui tu as appelé, ce qui a été dit, le résultat obtenu.
+"""
+
     session = AgentSession(
         stt=deepgram.STT(
             model="nova-3",
@@ -101,7 +139,7 @@ async def entrypoint(ctx: agents.JobContext):
     await session.start(
         room=ctx.room,
         agent=Agent(
-            instructions=SYSTEM_PROMPT,
+            instructions=prompt,
             tools=TOOLS,
         ),
         # noise_cancellation désactivé : le plugin BVC n'est pas installé et le
@@ -211,17 +249,25 @@ async def entrypoint(ctx: agents.JobContext):
         if text.strip():
             _cancel_inactivity()
 
-    # Premier message via session.say() : plus fiable que generate_reply() car il
-    # ne dépend pas du LLM et teste directement le chemin TTS → track audio.
-    # Accueil conditionnel selon que l'appelant est identifié comme Raphaël.
-    if is_raphael():
-        greeting = "Bonjour Raphaël, c'est Claude. Que puis-je faire pour vous ?"
-    else:
-        greeting = (
-            "Bonjour, vous êtes en communication avec l'assistant de Raphaël. "
-            "Puis-je savoir qui appelle ?"
+    # Ouverture conditionnelle.
+    if is_outbound:
+        # Appel sortant : c'est l'agent qui ouvre. On laisse le LLM générer
+        # l'ouverture selon l'objectif plutôt qu'une phrase figée.
+        await session.generate_reply(
+            instructions="Présente-toi brièvement comme l'assistante de Raphaël "
+            "et annonce l'objet de ton appel."
         )
-    await session.say(greeting, allow_interruptions=True)
+    else:
+        # Appel entrant : accueil via session.say() (plus fiable que generate_reply,
+        # ne dépend pas du LLM et teste directement le chemin TTS → track audio).
+        if is_raphael():
+            greeting = "Bonjour Raphaël, c'est Claude. Que puis-je faire pour vous ?"
+        else:
+            greeting = (
+                "Bonjour, vous êtes en communication avec l'assistant de Raphaël. "
+                "Puis-je savoir qui appelle ?"
+            )
+        await session.say(greeting, allow_interruptions=True)
 
 
 if __name__ == "__main__":
