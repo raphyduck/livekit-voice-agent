@@ -1,9 +1,11 @@
 import os
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
 import httpx
-from livekit.agents import function_tool
+from livekit import api
+from livekit.agents import function_tool, get_job_context
 
 from .mcp_client import MCPClient
 
@@ -307,3 +309,25 @@ async def get_current_datetime() -> str:
         f"Nous sommes le {jour} {now.day} {mois} {now.year}, "
         f"il est {now.hour} heures {now.minute:02d}."
     )
+
+
+# ---------------------------------------------------------------------------
+# Raccrochage
+# ---------------------------------------------------------------------------
+
+@function_tool()
+async def end_call() -> str:
+    """Raccroche et met fin à l'appel téléphonique en cours.
+
+    À utiliser quand l'interlocuteur dit au revoir, que la conversation est
+    clairement terminée, ou qu'il n'y a plus rien à faire.
+    """
+    try:
+        ctx = get_job_context()
+        # Laisser le dernier TTS se jouer avant de couper la ligne.
+        await asyncio.sleep(0.5)
+        await ctx.api.room.delete_room(api.DeleteRoomRequest(room=ctx.room.name))
+        return "Appel terminé."
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Erreur end_call")
+        return f"Je n'ai pas pu raccrocher : {e}"

@@ -1,9 +1,10 @@
+import asyncio
 import logging
 import os
 
 from dotenv import load_dotenv
 
-from livekit import agents
+from livekit import agents, api
 from livekit.agents import Agent, AgentSession, RoomInputOptions, RoomOutputOptions
 from livekit.plugins import anthropic, cartesia, deepgram, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
@@ -12,6 +13,7 @@ from .system_prompt import SYSTEM_PROMPT
 from .tools import (
     add_task,
     create_calendar_event,
+    end_call,
     get_calendar_events,
     get_current_datetime,
     get_today_tasks,
@@ -24,6 +26,9 @@ from .tools import (
 load_dotenv()
 logger = logging.getLogger("voice-agent")
 
+# Délai de silence (secondes) avant relance puis raccrochage.
+INACTIVITY_TIMEOUT = 10.0
+
 TOOLS = [
     get_calendar_events,
     create_calendar_event,
@@ -34,6 +39,7 @@ TOOLS = [
     search_notion,
     send_sms,
     get_current_datetime,
+    end_call,
 ]
 
 
@@ -69,7 +75,8 @@ async def entrypoint(ctx: agents.JobContext):
         ),
         # noise_cancellation désactivé : le plugin BVC n'est pas installé et le
         # laisser actif peut bloquer silencieusement la publication audio.
-        room_input_options=RoomInputOptions(),
+        # delete_room_on_close ferme la room (et coupe la ligne) à la fin.
+        room_input_options=RoomInputOptions(delete_room_on_close=True),
         # audio_enabled=True est le fix central : force la publication du track
         # audio de sortie de l'agent dans la room.
         room_output_options=RoomOutputOptions(
@@ -77,6 +84,61 @@ async def entrypoint(ctx: agents.JobContext):
             transcription_enabled=True,
         ),
     )
+
+    # --- Relance puis raccrochage sur silence prolongé -------------------
+    # On arme un minuteur quand l'agent repasse en écoute ; on l'annule dès que
+    # l'utilisateur reparle. Après INACTIVITY_TIMEOUT de silence on relance une
+    # fois, puis au silence suivant on raccroche poliment.
+    inactivity_task: asyncio.Task | None = None
+    relance_count = 0
+
+    async def _hangup() -> None:
+        try:
+            await ctx.api.room.delete_room(api.DeleteRoomRequest(room=ctx.room.name))
+        except Exception:  # noqa: BLE001
+            logger.exception("Échec du raccrochage automatique")
+
+    async def _inactivity_watch() -> None:
+        nonlocal relance_count
+        try:
+            await asyncio.sleep(INACTIVITY_TIMEOUT)
+        except asyncio.CancelledError:
+            return
+        relance_count += 1
+        if relance_count == 1:
+            # Le retour en état "listening" ré-armera automatiquement le minuteur.
+            await session.say("Vous êtes toujours là ?", allow_interruptions=True)
+        else:
+            await session.say(
+                "Je vais raccrocher, n'hésitez pas à me rappeler. Au revoir.",
+                allow_interruptions=False,
+            )
+            await _hangup()
+
+    def _arm_inactivity() -> None:
+        nonlocal inactivity_task
+        current = asyncio.current_task()
+        # Ne jamais s'auto-annuler : on ignore la tâche courante.
+        if inactivity_task and inactivity_task is not current and not inactivity_task.done():
+            inactivity_task.cancel()
+        inactivity_task = asyncio.create_task(_inactivity_watch())
+
+    def _cancel_inactivity() -> None:
+        nonlocal inactivity_task, relance_count
+        relance_count = 0
+        if inactivity_task and not inactivity_task.done():
+            inactivity_task.cancel()
+        inactivity_task = None
+
+    @session.on("user_state_changed")
+    def _on_user_state(ev):
+        if getattr(ev, "new_state", None) == "speaking":
+            _cancel_inactivity()
+
+    @session.on("agent_state_changed")
+    def _on_agent_state(ev):
+        if getattr(ev, "new_state", None) == "listening":
+            _arm_inactivity()
 
     # Premier message via session.say() : plus fiable que generate_reply() car il
     # ne dépend pas du LLM et teste directement le chemin TTS → track audio.
@@ -87,5 +149,5 @@ async def entrypoint(ctx: agents.JobContext):
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.DEBUG)
     agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint))
