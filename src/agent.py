@@ -31,6 +31,24 @@ from .tools import (
 load_dotenv()
 logger = logging.getLogger("voice-agent")
 
+# --- Correctif Haiku 4.5 (et autres Claude 4.x récents) -------------------
+# Le plugin livekit-plugins-anthropic 1.6.0 ne connaît pas claude-haiku-4-5.
+# Sa liste _NO_PREFILL_PATTERNS (modèles qui NE supportent PAS le prefill /
+# message assistant final) ne contient que sonnet-4-6 et opus-4-6. Pour tout
+# autre modèle, le plugin laisse un message assistant en position finale
+# (prefill), ce qui casse silencieusement la génération avec Haiku 4.5
+# (l'agent entend mais ne répond jamais). On élargit la liste pour couvrir
+# les Claude 4.x récents qui se comportent comme 4.6 côté prefill.
+try:
+    import livekit.plugins.anthropic.llm as _anthropic_llm
+    _extra_no_prefill = ("claude-haiku-4-5",)
+    _existing = tuple(_anthropic_llm._NO_PREFILL_PATTERNS)
+    _merged = _existing + tuple(p for p in _extra_no_prefill if p not in _existing)
+    _anthropic_llm._NO_PREFILL_PATTERNS = _merged
+    logger.info("Patch prefill appliqué, modèles no-prefill: %s", _merged)
+except Exception:  # noqa: BLE001
+    logger.exception("Échec du patch _NO_PREFILL_PATTERNS")
+
 # Délai de silence (secondes) avant relance puis raccrochage.
 INACTIVITY_TIMEOUT = 10.0
 
