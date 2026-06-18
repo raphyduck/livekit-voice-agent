@@ -360,8 +360,9 @@ async def write_journal(action: str, detail: str = "", type: str = "info") -> st
         detail: Détails complémentaires (optionnel).
         type: Catégorie : 'info', 'action', 'erreur' ou 'décision requise'.
     """
-    if not is_raphael():
-        return _ACCESS_DENIED
+    # NB : write_journal n'est PAS gardé par is_raphael(). Le journal est une
+    # trace interne (jamais lue à l'appelant) et doit rester disponible sur les
+    # appels SORTANTS pour le compte-rendu de fin d'appel.
     if type not in _JOURNAL_TYPES:
         type = "info"
     payload = {
