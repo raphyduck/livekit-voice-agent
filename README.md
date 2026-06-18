@@ -56,6 +56,7 @@ docker compose logs -f
 | `get_calendar_events`, `create_calendar_event` | Google Calendar (API directe) |
 | `get_unread_emails`, `send_email` | IMAP MCP self-hosted |
 | `get_today_tasks`, `add_task` | Todoist (API directe) |
-| `search_notion` | Notion (API directe) |
+| `read_brain`, `write_journal` | Notion (API directe) — lecture du brain, écriture dans le Journal |
 | `send_sms` | Twilio MCP self-hosted |
 | `get_current_datetime` | local |
+| `end_call` | LiveKit (raccrochage) |

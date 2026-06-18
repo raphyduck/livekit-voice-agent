@@ -227,6 +227,20 @@ async def add_task(content: str, due_string: str = "aujourd'hui") -> str:
 # Notion (API directe)
 # ---------------------------------------------------------------------------
 
+_NOTION_VERSION = "2022-06-28"
+# Base "Journal" du brain (append-only ; l'agent y écrit ses traces d'activité).
+_JOURNAL_DB_ID = "1781b732-9e14-42f7-9c61-ab63e3f8ff0d"
+_JOURNAL_TYPES = {"info", "action", "erreur", "décision requise"}
+
+
+def _notion_headers() -> dict:
+    return {
+        "Authorization": f"Bearer {os.environ['NOTION_API_KEY']}",
+        "Notion-Version": _NOTION_VERSION,
+        "Content-Type": "application/json",
+    }
+
+
 def _extract_notion_title(page: dict) -> str:
     props = page.get("properties", {})
     for prop in props.values():
@@ -242,31 +256,100 @@ def _extract_notion_title(page: dict) -> str:
 
 
 @function_tool()
-async def search_notion(query: str) -> str:
-    """Recherche dans le brain Notion de Raphaël.
+async def read_brain(query: str) -> str:
+    """Consulte le cerveau (brain) Notion de Raphaël : profil, agents, journal, items ouverts.
+
+    Renvoie le contenu des entrées les plus pertinentes, pas seulement les titres.
 
     Args:
-        query: Termes à rechercher.
+        query: Termes à rechercher (sujet, nom d'agent, infra, etc.).
     """
+    headers = _notion_headers()
     try:
         async with httpx.AsyncClient(timeout=READ_TIMEOUT) as client:
             r = await client.post(
                 "https://api.notion.com/v1/search",
-                headers={
-                    "Authorization": f"Bearer {os.environ['NOTION_API_KEY']}",
-                    "Notion-Version": "2022-06-28",
-                    "Content-Type": "application/json",
-                },
+                headers=headers,
                 json={"query": query, "page_size": 3},
             )
             r.raise_for_status()
             results = r.json().get("results", [])
-        if not results:
-            return "Aucun résultat dans Notion."
-        return ". ".join(_extract_notion_title(p) for p in results)
+            if not results:
+                return "Aucun résultat dans le brain."
+
+            out = []
+            for page in results[:3]:
+                title = _extract_notion_title(page)
+                pid = page.get("id")
+
+                # Récupérer le contenu (blocks) de la page.
+                text_parts = []
+                try:
+                    br = await client.get(
+                        f"https://api.notion.com/v1/blocks/{pid}/children?page_size=20",
+                        headers=headers,
+                    )
+                    br.raise_for_status()
+                    for blk in br.json().get("results", []):
+                        t = blk.get(blk.get("type"), {})
+                        for rt in t.get("rich_text", []):
+                            text_parts.append(rt.get("plain_text", ""))
+                except Exception:  # noqa: BLE001
+                    pass
+
+                # Inclure aussi les valeurs des propriétés texte/select de la page.
+                props = page.get("properties", {})
+                prop_bits = []
+                for _name, p in props.items():
+                    ptype = p.get("type")
+                    if ptype == "rich_text":
+                        prop_bits.append(
+                            " ".join(rt.get("plain_text", "") for rt in p.get("rich_text", []))
+                        )
+                    elif ptype == "select" and p.get("select"):
+                        prop_bits.append(p["select"].get("name", ""))
+
+                body = " ".join(b for b in (prop_bits + text_parts) if b).strip()
+                out.append(f"{title} : {body[:600]}" if body else title)
+            return "\n\n".join(out)
     except Exception as e:  # noqa: BLE001
-        logger.exception("Erreur search_notion")
-        return f"Je n'ai pas pu chercher dans Notion : {e}"
+        logger.exception("Erreur read_brain")
+        return f"Je n'ai pas pu consulter le brain : {e}"
+
+
+@function_tool()
+async def write_journal(action: str, detail: str = "", type: str = "info") -> str:
+    """Ajoute une entrée au Journal du brain Notion de Raphaël (trace d'activité).
+
+    À utiliser pour consigner une action faite ou une info importante issue de l'appel.
+
+    Args:
+        action: Résumé court de ce qui s'est passé (titre).
+        detail: Détails complémentaires (optionnel).
+        type: Catégorie : 'info', 'action', 'erreur' ou 'décision requise'.
+    """
+    if type not in _JOURNAL_TYPES:
+        type = "info"
+    payload = {
+        "parent": {"database_id": _JOURNAL_DB_ID},
+        "properties": {
+            "Action": {"title": [{"text": {"content": action[:200]}}]},
+            "Détail": {"rich_text": [{"text": {"content": detail[:1800]}}]},
+            "Source": {"rich_text": [{"text": {"content": "agent vocal"}}]},
+            "Agent": {"rich_text": [{"text": {"content": "Claude (assistant)"}}]},
+            "Type": {"select": {"name": type}},
+        },
+    }
+    try:
+        async with httpx.AsyncClient(timeout=WRITE_TIMEOUT) as client:
+            r = await client.post(
+                "https://api.notion.com/v1/pages", headers=_notion_headers(), json=payload
+            )
+            r.raise_for_status()
+        return "Note ajoutée au journal."
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Erreur write_journal")
+        return f"Je n'ai pas pu écrire dans le journal : {e}"
 
 
 # ---------------------------------------------------------------------------
