@@ -18,9 +18,10 @@ from .tools import (
     get_current_datetime,
     get_today_tasks,
     get_unread_emails,
-    search_notion,
+    read_brain,
     send_email,
     send_sms,
+    write_journal,
 )
 
 load_dotenv()
@@ -36,7 +37,8 @@ TOOLS = [
     send_email,
     get_today_tasks,
     add_task,
-    search_notion,
+    read_brain,
+    write_journal,
     send_sms,
     get_current_datetime,
     end_call,
