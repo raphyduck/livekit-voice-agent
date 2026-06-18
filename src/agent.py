@@ -5,7 +5,7 @@ import os
 from dotenv import load_dotenv
 
 from livekit import agents, api
-from livekit.agents import Agent, AgentSession, RoomInputOptions, RoomOutputOptions
+from livekit.agents import Agent, AgentSession, RoomInputOptions, RoomOutputOptions, metrics
 from livekit.plugins import anthropic, cartesia, deepgram, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
@@ -67,6 +67,15 @@ async def entrypoint(ctx: agents.JobContext):
         ),
         vad=silero.VAD.load(),
         turn_detection=MultilingualModel(),
+        # --- Optimisations latence ---
+        # Réduire le délai avant de considérer que l'utilisateur a fini de parler
+        # (EOU mesuré ~1.4s par défaut). Plus court = réponse plus rapide, au prix
+        # d'un risque accru de couper si l'utilisateur fait une longue pause.
+        min_endpointing_delay=0.4,
+        max_endpointing_delay=3.0,
+        # Laisser le LLM commencer à générer pendant que l'utilisateur finit :
+        # gros gain de latence perçue.
+        preemptive_generation=True,
     )
 
     await session.start(
@@ -93,6 +102,14 @@ async def entrypoint(ctx: agents.JobContext):
     # fois, puis au silence suivant on raccroche poliment.
     inactivity_task: asyncio.Task | None = None
     relance_count = 0
+
+    # --- Mesure de latence : loguer les métriques de chaque tour ----------
+    @session.on("metrics_collected")
+    def _on_metrics(ev):
+        try:
+            metrics.log_metrics(ev.metrics)
+        except Exception:  # noqa: BLE001
+            logger.debug("metrics: %s", getattr(ev, "metrics", None))
 
     async def _hangup() -> None:
         try:
