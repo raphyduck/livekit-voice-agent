@@ -15,6 +15,28 @@ logger = logging.getLogger("voice-agent.tools")
 READ_TIMEOUT = 5.0
 WRITE_TIMEOUT = 15.0
 
+# ---------------------------------------------------------------------------
+# Identité de l'appelant (authentification faible : caller ID + mot de passe)
+# ---------------------------------------------------------------------------
+# Le worker traite un appel par process : une variable de module est donc
+# acceptable ici. On la remet à False au début de chaque appel (reset_identity).
+_IDENTITY = {"is_raphael": False}
+
+# Message neutre renvoyé par les outils sensibles tant que l'identité n'est pas
+# confirmée (ne révèle rien sur l'existence d'un mot de passe).
+_ACCESS_DENIED = (
+    "Désolé, cette information est réservée à Raphaël. Je peux seulement prendre "
+    "un message ou donner des informations générales."
+)
+
+
+def reset_identity(value: bool = False) -> None:
+    _IDENTITY["is_raphael"] = value
+
+
+def is_raphael() -> bool:
+    return _IDENTITY["is_raphael"]
+
 # Clients MCP self-hosted (instanciés paresseusement pour éviter une erreur
 # si les variables d'environnement ne sont pas encore chargées à l'import).
 _imap_client: MCPClient | None = None
@@ -120,6 +142,8 @@ async def create_calendar_event(
         end_datetime: Fin au format ISO 8601.
         description: Description optionnelle.
     """
+    if not is_raphael():
+        return _ACCESS_DENIED
     try:
         service = _calendar_service()
         body = {
@@ -146,6 +170,8 @@ async def get_unread_emails(limit: int = 5) -> str:
     Args:
         limit: Nombre maximum d'emails à retourner.
     """
+    if not is_raphael():
+        return _ACCESS_DENIED
     try:
         return await _imap().call_tool(
             "imap_get_latest_emails", {"folder": "INBOX", "limit": limit}
@@ -164,6 +190,8 @@ async def send_email(to: str, subject: str, body: str) -> str:
         subject: Objet de l'email.
         body: Contenu de l'email.
     """
+    if not is_raphael():
+        return _ACCESS_DENIED
     try:
         return await _imap().call_tool(
             "imap_send_email", {"to": to, "subject": subject, "body": body}
@@ -205,6 +233,8 @@ async def add_task(content: str, due_string: str = "aujourd'hui") -> str:
         content: Intitulé de la tâche.
         due_string: Échéance en langage naturel (ex: aujourd'hui, demain, lundi).
     """
+    if not is_raphael():
+        return _ACCESS_DENIED
     try:
         async with httpx.AsyncClient(timeout=WRITE_TIMEOUT) as client:
             r = await client.post(
@@ -264,6 +294,8 @@ async def read_brain(query: str) -> str:
     Args:
         query: Termes à rechercher (sujet, nom d'agent, infra, etc.).
     """
+    if not is_raphael():
+        return _ACCESS_DENIED
     headers = _notion_headers()
     try:
         async with httpx.AsyncClient(timeout=READ_TIMEOUT) as client:
@@ -328,6 +360,8 @@ async def write_journal(action: str, detail: str = "", type: str = "info") -> st
         detail: Détails complémentaires (optionnel).
         type: Catégorie : 'info', 'action', 'erreur' ou 'décision requise'.
     """
+    if not is_raphael():
+        return _ACCESS_DENIED
     if type not in _JOURNAL_TYPES:
         type = "info"
     payload = {
@@ -364,6 +398,8 @@ async def send_sms(to: str, message: str) -> str:
         to: Numéro de téléphone du destinataire.
         message: Contenu du SMS.
     """
+    if not is_raphael():
+        return _ACCESS_DENIED
     try:
         return await _twilio().call_tool("send_sms", {"to": to, "body": message})
     except Exception as e:  # noqa: BLE001
@@ -423,3 +459,27 @@ async def end_call() -> str:
     except Exception as e:  # noqa: BLE001
         logger.exception("Erreur end_call")
         return f"Je n'ai pas pu raccrocher : {e}"
+
+
+# ---------------------------------------------------------------------------
+# Vérification d'identité
+# ---------------------------------------------------------------------------
+
+@function_tool()
+async def verifier_identite(mot_de_passe: str) -> str:
+    """Vérifie l'identité de l'appelant via un mot de passe.
+
+    À utiliser uniquement si l'appelant prétend être Raphaël mais appelle d'un
+    numéro inconnu.
+
+    Args:
+        mot_de_passe: Le mot de passe énoncé par l'appelant.
+    """
+    expected = os.environ.get("RAPHAEL_VOICE_PASSWORD", "")
+    if expected and mot_de_passe.strip().lower() == expected.strip().lower():
+        _IDENTITY["is_raphael"] = True
+        return "Identité confirmée. Bonjour Raphaël."
+    return (
+        "Mot de passe incorrect. Je ne peux pas vous donner accès aux "
+        "informations personnelles."
+    )

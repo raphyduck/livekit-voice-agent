@@ -18,9 +18,12 @@ from .tools import (
     get_current_datetime,
     get_today_tasks,
     get_unread_emails,
+    is_raphael,
     read_brain,
+    reset_identity,
     send_email,
     send_sms,
+    verifier_identite,
     write_journal,
 )
 
@@ -42,12 +45,27 @@ TOOLS = [
     send_sms,
     get_current_datetime,
     end_call,
+    verifier_identite,
 ]
 
 
 async def entrypoint(ctx: agents.JobContext):
     logger.info("Agent démarré pour la room: %s", ctx.room.name)
     await ctx.connect()
+
+    # --- Identification de l'appelant (caller ID, authentification faible) ----
+    # NB : le caller ID SIP est spoofable et un mot de passe parlé est faible ;
+    # c'est un compromis assumé pour un usage perso, pas une sécurité forte.
+    reset_identity(False)  # repartir non identifié à chaque appel
+    raphael_phone = os.environ.get("RAPHAEL_PHONE", "")
+    caller = ""
+    try:
+        participant = await ctx.wait_for_participant()
+        caller = participant.attributes.get("sip.phoneNumber", "")
+    except Exception:  # noqa: BLE001
+        logger.exception("Impossible de lire le participant appelant")
+    logger.info("Appel entrant de: %s", caller or "inconnu")
+    reset_identity(bool(raphael_phone) and caller == raphael_phone)
 
     session = AgentSession(
         stt=deepgram.STT(
@@ -193,10 +211,15 @@ async def entrypoint(ctx: agents.JobContext):
 
     # Premier message via session.say() : plus fiable que generate_reply() car il
     # ne dépend pas du LLM et teste directement le chemin TTS → track audio.
-    await session.say(
-        "Bonjour, c'est Claude, l'assistant de Raphaël. Que puis-je faire pour vous ?",
-        allow_interruptions=True,
-    )
+    # Accueil conditionnel selon que l'appelant est identifié comme Raphaël.
+    if is_raphael():
+        greeting = "Bonjour Raphaël, c'est Claude. Que puis-je faire pour vous ?"
+    else:
+        greeting = (
+            "Bonjour, vous êtes en communication avec l'assistant de Raphaël. "
+            "Puis-je savoir qui appelle ?"
+        )
+    await session.say(greeting, allow_interruptions=True)
 
 
 if __name__ == "__main__":
