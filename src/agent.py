@@ -4,7 +4,7 @@ import os
 from dotenv import load_dotenv
 
 from livekit import agents
-from livekit.agents import Agent, AgentSession, RoomInputOptions
+from livekit.agents import Agent, AgentSession, RoomInputOptions, RoomOutputOptions
 from livekit.plugins import anthropic, cartesia, deepgram, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
@@ -53,7 +53,7 @@ async def entrypoint(ctx: agents.JobContext):
             temperature=0.7,
         ),
         tts=cartesia.TTS(
-            model="sonic-multilingual",
+            model="sonic-2",
             voice=os.environ["CARTESIA_VOICE_ID"],
             language="fr",
         ),
@@ -67,12 +67,22 @@ async def entrypoint(ctx: agents.JobContext):
             instructions=SYSTEM_PROMPT,
             tools=TOOLS,
         ),
+        # noise_cancellation désactivé : le plugin BVC n'est pas installé et le
+        # laisser actif peut bloquer silencieusement la publication audio.
         room_input_options=RoomInputOptions(),
+        # audio_enabled=True est le fix central : force la publication du track
+        # audio de sortie de l'agent dans la room.
+        room_output_options=RoomOutputOptions(
+            audio_enabled=True,
+            transcription_enabled=True,
+        ),
     )
 
-    await session.generate_reply(
-        instructions="Salue l'appelant en français, présente-toi comme Claude "
-        "l'assistant de Raphaël, et demande ce que tu peux faire."
+    # Premier message via session.say() : plus fiable que generate_reply() car il
+    # ne dépend pas du LLM et teste directement le chemin TTS → track audio.
+    await session.say(
+        "Bonjour, c'est Claude, l'assistant de Raphaël. Que puis-je faire pour vous ?",
+        allow_interruptions=True,
     )
 
 
