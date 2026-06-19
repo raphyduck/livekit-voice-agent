@@ -37,6 +37,25 @@ def reset_identity(value: bool = False) -> None:
 def is_raphael() -> bool:
     return _IDENTITY["is_raphael"]
 
+# Etat par appel : un compte-rendu a-t-il deja ete ecrit ?
+# journal_page_id : id de la page Journal creee pour CET appel (idempotence).
+# journal_detail  : texte deja consigne, pour fusionner sans relire Notion.
+_CALL_STATE = {"journal_written": False, "journal_page_id": None, "journal_detail": ""}
+
+
+def reset_call_state() -> None:
+    _CALL_STATE["journal_written"] = False
+    _CALL_STATE["journal_page_id"] = None
+    _CALL_STATE["journal_detail"] = ""
+
+
+def journal_was_written() -> bool:
+    return _CALL_STATE["journal_written"]
+
+
+def journal_page_id():
+    return _CALL_STATE["journal_page_id"]
+
 # Clients MCP self-hosted (instanciés paresseusement pour éviter une erreur
 # si les variables d'environnement ne sont pas encore chargées à l'import).
 _imap_client: MCPClient | None = None
@@ -259,7 +278,7 @@ async def add_task(content: str, due_string: str = "aujourd'hui") -> str:
 
 _NOTION_VERSION = "2022-06-28"
 # Base "Journal" du brain (append-only ; l'agent y écrit ses traces d'activité).
-_JOURNAL_DB_ID = "1781b732-9e14-42f7-9c61-ab63e3f8ff0d"
+_JOURNAL_DB_ID = "091cce0e-375e-4a51-a310-3592c359bcd1"
 _JOURNAL_TYPES = {"info", "action", "erreur", "décision requise"}
 
 
@@ -349,8 +368,7 @@ async def read_brain(query: str) -> str:
         return f"Je n'ai pas pu consulter le brain : {e}"
 
 
-@function_tool()
-async def write_journal(action: str, detail: str = "", type: str = "info") -> str:
+async def write_journal_raw(action: str, detail: str = "", type: str = "info") -> str:
     """Ajoute une entrée au Journal du brain Notion de Raphaël (trace d'activité).
 
     À utiliser pour consigner une action faite ou une info importante issue de l'appel.
@@ -365,6 +383,33 @@ async def write_journal(action: str, detail: str = "", type: str = "info") -> st
     # appels SORTANTS pour le compte-rendu de fin d'appel.
     if type not in _JOURNAL_TYPES:
         type = "info"
+
+    # Idempotence par appel : si une entree a deja ete creee pour CET appel,
+    # on MET A JOUR cette page (fusion du Detail) au lieu d'en creer une autre.
+    existing_id = _CALL_STATE["journal_page_id"]
+    if existing_id:
+        prev = _CALL_STATE["journal_detail"]
+        ajout = (action + " — " + detail) if detail else action
+        sep = chr(10) + "— maj : "
+        merged = ((prev + sep + ajout) if prev else ajout)[:1900]
+        payload = {
+            "properties": {
+                "Détail": {"rich_text": [{"text": {"content": merged}}]},
+            },
+        }
+        try:
+            async with httpx.AsyncClient(timeout=WRITE_TIMEOUT) as client:
+                r = await client.patch(
+                    f"https://api.notion.com/v1/pages/{existing_id}",
+                    headers=_notion_headers(), json=payload,
+                )
+                r.raise_for_status()
+            _CALL_STATE["journal_detail"] = merged
+            return "Journal mis à jour (entrée unique de l'appel)."
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Erreur write_journal (maj)")
+            return f"Je n'ai pas pu mettre à jour le journal : {e}"
+
     payload = {
         "parent": {"database_id": _JOURNAL_DB_ID},
         "properties": {
@@ -381,10 +426,20 @@ async def write_journal(action: str, detail: str = "", type: str = "info") -> st
                 "https://api.notion.com/v1/pages", headers=_notion_headers(), json=payload
             )
             r.raise_for_status()
+            data = r.json()
+        _CALL_STATE["journal_written"] = True
+        _CALL_STATE["journal_page_id"] = data.get("id")
+        _CALL_STATE["journal_detail"] = detail[:1800]
         return "Note ajoutée au journal."
     except Exception as e:  # noqa: BLE001
         logger.exception("Erreur write_journal")
         return f"Je n'ai pas pu écrire dans le journal : {e}"
+
+
+@function_tool()
+async def write_journal(action: str, detail: str = "", type: str = "info") -> str:
+    """Ajoute une entree au Journal du brain Notion (trace interne)."""
+    return await write_journal_raw(action, detail, type)
 
 
 # ---------------------------------------------------------------------------
@@ -484,3 +539,76 @@ async def verifier_identite(mot_de_passe: str) -> str:
         "Mot de passe incorrect. Je ne peux pas vous donner accès aux "
         "informations personnelles."
     )
+
+
+
+# ---------------------------------------------------------------------------
+# DTMF (tonalites) - navigation de serveurs vocaux
+# ---------------------------------------------------------------------------
+_DTMF_CODES = {**{str(i): i for i in range(10)}, "*": 10, "#": 11}
+
+
+@function_tool()
+async def envoyer_touches(touches: str) -> str:
+    """Envoie une sequence de touches DTMF (tonalites) sur la ligne en cours.
+
+    Utile pour naviguer un serveur vocal automatise : saisir un code postal,
+    choisir une option de menu, taper un numero de poste, etc.
+
+    Args:
+        touches: La sequence a composer, ex. "30700#" ou "1". Caracteres
+            autorises : chiffres 0-9, * et #. Les autres sont ignores.
+    """
+    try:
+        ctx = get_job_context()
+        lp = ctx.room.local_participant
+        envoyees = []
+        for ch in touches:
+            code = _DTMF_CODES.get(ch)
+            if code is None:
+                continue
+            await lp.publish_dtmf(code=code, digit=ch)
+            envoyees.append(ch)
+            await asyncio.sleep(0.25)
+        if not envoyees:
+            return "Aucune touche valide (chiffres, * ou # uniquement)."
+        return "Touches envoyees : " + "".join(envoyees)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Erreur envoyer_touches")
+        return "Touches non envoyees : " + str(e)
+
+async def append_journal_transcript(transcript: str) -> None:
+    """Ajoute le transcript de l'appel comme contenu (blocs) de l'entree Journal
+    de CET appel. Cree d'abord l'entree si aucune n'existe (raccroche precoce).
+    Notion limite chaque bloc texte a ~2000 caracteres : on decoupe en morceaux.
+    """
+    page_id = _CALL_STATE["journal_page_id"]
+    if not page_id:
+        await write_journal_raw(
+            "Appel sortant - transcript auto",
+            "Compte-rendu automatique : transcript ci-dessous.",
+            "info",
+        )
+        page_id = _CALL_STATE["journal_page_id"]
+        if not page_id:
+            return
+    texte = transcript or "(aucun echange capte)"
+    morceaux = [texte[i:i + 1900] for i in range(0, len(texte), 1900)] or [texte]
+    children = [{
+        "object": "block", "type": "heading_3",
+        "heading_3": {"rich_text": [{"text": {"content": "Transcript de l'appel"}}]},
+    }]
+    for m in morceaux[:90]:
+        children.append({
+            "object": "block", "type": "paragraph",
+            "paragraph": {"rich_text": [{"text": {"content": m}}]},
+        })
+    try:
+        async with httpx.AsyncClient(timeout=WRITE_TIMEOUT) as client:
+            r = await client.patch(
+                f"https://api.notion.com/v1/blocks/{page_id}/children",
+                headers=_notion_headers(), json={"children": children},
+            )
+            r.raise_for_status()
+    except Exception:  # noqa: BLE001
+        logger.exception("Erreur append_journal_transcript")

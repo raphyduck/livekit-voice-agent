@@ -26,6 +26,12 @@ from .tools import (
     send_sms,
     verifier_identite,
     write_journal,
+    envoyer_touches,
+    journal_was_written,
+    reset_call_state,
+    write_journal_raw,
+    journal_page_id,
+    append_journal_transcript,
 )
 
 load_dotenv()
@@ -65,6 +71,7 @@ TOOLS = [
     get_current_datetime,
     end_call,
     verifier_identite,
+    envoyer_touches,
 ]
 
 
@@ -105,6 +112,7 @@ async def entrypoint(ctx: agents.JobContext):
     # NB : le caller ID SIP est spoofable et un mot de passe parlé est faible ;
     # c'est un compromis assumé pour un usage perso, pas une sécurité forte.
     reset_identity(False)  # repartir non identifié à chaque appel
+    reset_call_state()
     raphael_phone = os.environ.get("RAPHAEL_PHONE", "")
     caller = ""
     try:
@@ -148,8 +156,6 @@ CONTEXTE DE CET APPEL (SORTANT) :
 - Objectif précis : {objectif}
 - Informations utiles : {contexte_appel or "aucune"}
 - Mène la conversation vers cet objectif, poliment et efficacement.
-- À la fin de l'appel, AVANT de raccrocher, rédige un compte-rendu concis avec write_journal
-  (type "action") résumant : qui tu as appelé, ce qui a été dit, le résultat obtenu.
 """
 
     # --- Serveurs MCP self-hosted (gating sécurité) --------------------------
@@ -305,6 +311,40 @@ CONTEXTE DE CET APPEL (SORTANT) :
         if text.strip():
             _cancel_inactivity()
 
+    # --- Fin d'appel : on persiste TOUJOURS le transcript (appel sortant) -----
+    # Le transcript est ajoute comme contenu de l'entree Journal UNIQUE de
+    # l'appel (idempotence cote write_journal). append_journal_transcript cree
+    # l'entree si aucune n'existe encore (ex. raccroche avant tout compte-rendu).
+    async def _journal_fin_appel():
+        try:
+            if not is_outbound:
+                return
+            NL = chr(10)
+            lignes = []
+            try:
+                for it in session.history.items:
+                    role = getattr(it, "role", "")
+                    if role not in ("user", "assistant"):
+                        continue
+                    txt = getattr(it, "text_content", None)
+                    if txt is None:
+                        c = getattr(it, "content", "")
+                        if isinstance(c, list):
+                            txt = " ".join(x for x in c if isinstance(x, str))
+                        else:
+                            txt = str(c)
+                    if txt:
+                        qui = "Agent" if role == "assistant" else "Interlocuteur"
+                        lignes.append(qui + ": " + txt)
+            except Exception:
+                logger.exception("transcript illisible au shutdown")
+            transcript = NL.join(lignes) if lignes else "(aucun echange capte)"
+            await append_journal_transcript(transcript)
+        except Exception:
+            logger.exception("Echec compte-rendu auto au shutdown")
+    
+    ctx.add_shutdown_callback(_journal_fin_appel)
+    
     # Ouverture conditionnelle.
     if is_outbound:
         # Appel sortant : c'est l'agent qui ouvre. On laisse le LLM générer
