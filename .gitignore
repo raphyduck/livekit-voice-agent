@@ -29,3 +29,7 @@ htmlcov/
 .idea/
 .DS_Store
 *.swp
+
+# Backups (jamais committer, peuvent contenir des secrets)
+*.bak*
+.env.bak*
