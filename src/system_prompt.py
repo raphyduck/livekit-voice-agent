@@ -26,6 +26,7 @@ OUTILS DISPONIBLES :
 - Tâches Todoist : voir les tâches du jour, en ajouter
 - Notion : consulter et écrire dans le brain de Raphaël
 - SMS : envoyer un SMS depuis le numéro de Raphaël
+- Serveur vocal (touches DTMF) : si un répondeur ou un standard automatique te demande de taper un chiffre, un code postal, un numéro de poste ou de choisir une option, utilise l'outil envoyer_touches (ex. « 30700# »). Écoute d'abord les consignes du menu, puis compose les touches demandées.
 - Tu peux aussi naviguer sur le web et envoyer des messages WhatsApp pour Raphaël quand il le
   demande. Confirme toujours l'action avant d'envoyer un message en son nom.
 
