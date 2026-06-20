@@ -3,6 +3,8 @@ import json
 import logging
 import os
 
+import httpx
+
 from dotenv import load_dotenv
 
 from livekit import agents, api
@@ -24,6 +26,7 @@ from .tools import (
     reset_identity,
     send_email,
     send_sms,
+    lire_sms,
     verifier_identite,
     write_journal,
     envoyer_touches,
@@ -68,6 +71,7 @@ TOOLS = [
     read_brain,
     write_journal,
     send_sms,
+    lire_sms,
     get_current_datetime,
     end_call,
     verifier_identite,
@@ -75,32 +79,61 @@ TOOLS = [
 ]
 
 
-def _build_mcp_servers() -> list:
+async def _probe_mcp(url: str, headers: dict | None = None, timeout: float = 4.0) -> bool:
+    """Vérifie qu'un serveur MCP répond avant de l'attacher à l'agent.
+
+    Un serveur injoignable (DNS, refus de connexion, 4xx/5xx) ne doit JAMAIS
+    faire planter toolset.setup(), ce qui rendrait l'agent muet après le
+    message d'accueil. On ne garde le serveur que s'il répond avec un statut
+    < 400.
+    """
+    probe_headers = {"Accept": "text/event-stream"}
+    if headers:
+        probe_headers.update(headers)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with client.stream("GET", url, headers=probe_headers) as resp:
+                ok = resp.status_code < 400
+                if not ok:
+                    logger.warning("MCP %s répond %s, ignoré", url, resp.status_code)
+                return ok
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("MCP %s injoignable (%s), ignoré", url, exc)
+        return False
+
+
+async def _build_mcp_servers() -> list:
     """Serveurs MCP self-hosted attachés UNIQUEMENT pour Raphaël identifié.
 
     Navigateur (human-browser) + WhatsApp. IMAP reste géré par les outils codés
     (get_unread_emails/send_email) pour éviter le doublon. Bitwarden est exclu.
+
+    Chaque serveur est probé avant d'être attaché : un serveur injoignable est
+    ignoré (avec log) au lieu de faire planter le setup des outils.
     """
     servers = []
     brmcp_url = os.environ.get("BRMCP_URL")
     brmcp_token = os.environ.get("BRMCP_TOKEN")
     if brmcp_url and brmcp_token:
-        servers.append(
-            mcp.MCPServerHTTP(
-                url=brmcp_url,
-                headers={"Authorization": f"Bearer {brmcp_token}"},
-                client_session_timeout_seconds=10,
+        brmcp_headers = {"Authorization": f"Bearer {brmcp_token}"}
+        if await _probe_mcp(brmcp_url, brmcp_headers):
+            servers.append(
+                mcp.MCPServerHTTP(
+                    url=brmcp_url,
+                    headers=brmcp_headers,
+                    client_session_timeout_seconds=10,
+                )
             )
-        )
     wa_url = os.environ.get("WA_MCP_URL")
     if wa_url:
         # WhatsApp : le secret est déjà dans l'URL, pas de header.
-        servers.append(
-            mcp.MCPServerHTTP(
-                url=wa_url,
-                client_session_timeout_seconds=10,
+        if await _probe_mcp(wa_url):
+            servers.append(
+                mcp.MCPServerHTTP(
+                    url=wa_url,
+                    client_session_timeout_seconds=10,
+                )
             )
-        )
     return servers
 
 
@@ -139,6 +172,17 @@ async def entrypoint(ctx: agents.JobContext):
     objectif = call_ctx.get("objectif", "")
     scenario = call_ctx.get("scenario", "")
     contexte_appel = call_ctx.get("contexte", "")
+    consignes_perso = call_ctx.get("instructions", "")
+
+    # Modele par appel : entrant => Sonnet (qualite, besoin imprevisible) ;
+    # sortant => choix passe dans le metadata (defaut Haiku, sinon LLM_MODEL).
+    _MODEL_MAP = {"haiku": "claude-haiku-4-5", "sonnet": "claude-sonnet-4-6"}
+    if is_outbound:
+        _m = call_ctx.get("model") or os.environ.get("LLM_MODEL") or "haiku"
+        llm_model = _MODEL_MAP.get(_m, _m if _m.startswith("claude") else "claude-haiku-4-5")
+    else:
+        llm_model = "claude-sonnet-4-6"
+    logger.info("LLM pour cet appel: %s (outbound=%s)", llm_model, is_outbound)
 
     prompt = SYSTEM_PROMPT
     if is_outbound:
@@ -157,26 +201,29 @@ CONTEXTE DE CET APPEL (SORTANT) :
 - Informations utiles : {contexte_appel or "aucune"}
 - Mène la conversation vers cet objectif, poliment et efficacement.
 """
+        if consignes_perso:
+            prompt += f"- Stratégie spécifique pour cet appel : {consignes_perso}\n"
 
     # --- Serveurs MCP self-hosted (gating sécurité) --------------------------
     # Attachés UNIQUEMENT si l'appelant est identifié comme Raphaël. Appelant
     # inconnu OU appel sortant (l'appelé n'est pas Raphaël) => aucun serveur MCP,
     # pour ne jamais exposer ces outils à un tiers.
-    mcp_servers = _build_mcp_servers() if is_raphael() else []
+    mcp_servers = (await _build_mcp_servers()) if is_raphael() else []
     logger.info("Serveurs MCP attachés: %d (is_raphael=%s)", len(mcp_servers), is_raphael())
 
     session = AgentSession(
         stt=deepgram.STT(
             model="nova-3",
+            base_url="https://api.eu.deepgram.com/v1/listen",
             language="fr",
             smart_format=True,
             punctuate=True,
         ),
         llm=anthropic.LLM(
-            # Modèle configurable via .env (LLM_MODEL). Défaut: Sonnet.
-            # Pour tester Haiku (plus rapide) : LLM_MODEL=claude-haiku-4-5
-            model=os.environ.get("LLM_MODEL", "claude-sonnet-4-6"),
+            # Modèle décidé par appel : entrant => Sonnet ; sortant => metadata.
+            model=llm_model,
             temperature=0.7,
+            caching="ephemeral",
         ),
         tts=cartesia.TTS(
             model="sonic-2",
@@ -189,11 +236,11 @@ CONTEXTE DE CET APPEL (SORTANT) :
         # Réduire le délai avant de considérer que l'utilisateur a fini de parler
         # (EOU mesuré ~1.4s par défaut). Plus court = réponse plus rapide, au prix
         # d'un risque accru de couper si l'utilisateur fait une longue pause.
-        min_endpointing_delay=0.4,
-        max_endpointing_delay=3.0,
+        min_endpointing_delay=0.2,
+        max_endpointing_delay=1.0,
         # Laisser le LLM commencer à générer pendant que l'utilisateur finit :
         # gros gain de latence perçue.
-        preemptive_generation=True,
+        preemptive_generation=False,
         # Serveurs MCP (navigateur + WhatsApp), uniquement pour Raphaël identifié.
         mcp_servers=mcp_servers,
     )
@@ -347,12 +394,13 @@ CONTEXTE DE CET APPEL (SORTANT) :
     
     # Ouverture conditionnelle.
     if is_outbound:
-        # Appel sortant : c'est l'agent qui ouvre. On laisse le LLM générer
-        # l'ouverture selon l'objectif plutôt qu'une phrase figée.
-        await session.generate_reply(
-            instructions="Présente-toi brièvement comme l'assistante de Raphaël "
+        # Appel sortant : l'ouverture suit la stratégie passée par lancer_appel
+        # (instructions) si fournie, sinon une ouverture par défaut.
+        ouverture = consignes_perso or (
+            "Présente-toi brièvement comme l'assistante de Raphaël "
             "et annonce l'objet de ton appel."
         )
+        await session.generate_reply(instructions=ouverture)
     else:
         # Appel entrant : accueil via session.say() (plus fiable que generate_reply,
         # ne dépend pas du LLM et teste directement le chemin TTS → track audio).

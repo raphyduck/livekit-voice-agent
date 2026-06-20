@@ -463,6 +463,24 @@ async def send_sms(to: str, message: str) -> str:
         return f"Je n'ai pas pu envoyer le SMS : {e}"
 
 
+@function_tool()
+async def lire_sms(limit: int = 10) -> str:
+    """Liste les SMS récents (reçus et envoyés) du numéro de l'agent.
+
+    Args:
+        limit: Nombre de SMS à récupérer (par défaut 10).
+    """
+    if not is_raphael():
+        return _ACCESS_DENIED
+    try:
+        return await _twilio().call_tool("list_recent_sms", {"limit": limit})
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Erreur lire_sms")
+        return f"Je n'ai pas pu lire les SMS : {e}"
+
+
+
+
 # ---------------------------------------------------------------------------
 # Heure courante
 # ---------------------------------------------------------------------------
