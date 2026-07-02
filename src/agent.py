@@ -240,10 +240,33 @@ CONTEXTE DE CET APPEL (SORTANT) :
         max_endpointing_delay=1.0,
         # Laisser le LLM commencer à générer pendant que l'utilisateur finit :
         # gros gain de latence perçue.
-        preemptive_generation=False,
+        preemptive_generation=True,
         # Serveurs MCP (navigateur + WhatsApp), uniquement pour Raphaël identifié.
         mcp_servers=mcp_servers,
     )
+
+    # --- Capture live du transcript (fix bug 02/07/2026) ------------------
+    # session.history.items lu au shutdown peut manquer le dernier tour si
+    # l'appel se coupe brutalement (raccroche interlocuteur) avant que le
+    # tour soit "committed". conversation_item_added est émis de façon
+    # synchrone dès qu'un item (user OU assistant) est ajouté au contexte :
+    # on l'utilise comme source de vérité principale pour le transcript.
+    live_transcript: list[str] = []
+
+    @session.on("conversation_item_added")
+    def _on_conv_item(ev):
+        try:
+            item = ev.item
+            role = getattr(item, "role", "")
+            if role not in ("user", "assistant"):
+                return
+            txt = getattr(item, "text_content", None)
+            if not txt:
+                return
+            qui = "Agent" if role == "assistant" else "Interlocuteur"
+            live_transcript.append(f"{qui}: {txt}")
+        except Exception:
+            logger.exception("Erreur capture live transcript (conversation_item_added)")
 
     await session.start(
         room=ctx.room,
@@ -367,24 +390,27 @@ CONTEXTE DE CET APPEL (SORTANT) :
             if not is_outbound:
                 return
             NL = chr(10)
-            lignes = []
-            try:
-                for it in session.history.items:
-                    role = getattr(it, "role", "")
-                    if role not in ("user", "assistant"):
-                        continue
-                    txt = getattr(it, "text_content", None)
-                    if txt is None:
-                        c = getattr(it, "content", "")
-                        if isinstance(c, list):
-                            txt = " ".join(x for x in c if isinstance(x, str))
-                        else:
-                            txt = str(c)
-                    if txt:
-                        qui = "Agent" if role == "assistant" else "Interlocuteur"
-                        lignes.append(qui + ": " + txt)
-            except Exception:
-                logger.exception("transcript illisible au shutdown")
+            # Source principale : capture live (fiable même si raccroche brutal).
+            lignes = list(live_transcript)
+            if not lignes:
+                # Repli : lecture de l'historique au shutdown (comportement historique).
+                try:
+                    for it in session.history.items:
+                        role = getattr(it, "role", "")
+                        if role not in ("user", "assistant"):
+                            continue
+                        txt = getattr(it, "text_content", None)
+                        if txt is None:
+                            c = getattr(it, "content", "")
+                            if isinstance(c, list):
+                                txt = " ".join(x for x in c if isinstance(x, str))
+                            else:
+                                txt = str(c)
+                        if txt:
+                            qui = "Agent" if role == "assistant" else "Interlocuteur"
+                            lignes.append(qui + ": " + txt)
+                except Exception:
+                    logger.exception("transcript illisible au shutdown (repli history)")
             transcript = NL.join(lignes) if lignes else "(aucun echange capte)"
             await append_journal_transcript(transcript)
         except Exception:
