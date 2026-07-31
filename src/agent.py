@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import logging
 import os
 
@@ -8,9 +9,12 @@ import httpx
 from dotenv import load_dotenv
 
 from livekit import agents, api
-from livekit.agents import Agent, AgentSession, RoomInputOptions, RoomOutputOptions, mcp, metrics
+from livekit.agents import (
+    Agent, AgentSession, EndpointingOptions, RoomInputOptions, RoomOutputOptions,
+    TurnHandlingOptions, inference, mcp, metrics,
+)
+from livekit.agents.voice.turn import InterruptionOptions, PreemptiveGenerationOptions
 from livekit.plugins import anthropic, cartesia, deepgram, silero
-from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 from .system_prompt import SYSTEM_PROMPT
 from .tools import (
@@ -141,6 +145,35 @@ async def entrypoint(ctx: agents.JobContext):
     logger.info("Agent démarré pour la room: %s", ctx.room.name)
     await ctx.connect()
 
+    # --- Enregistrement audio (egress -> MinIO S3) en mode capture OTP --------
+    # LiveKit Cloud ecrit le fichier dans le bucket. On l'utilise pour transcrire
+    # les OTP a posteriori (Whisper), fiable la ou la transcription live echoue.
+    if os.environ.get("OTP_CAPTURE_MODE", "").strip() in ("1", "true", "True"):
+        try:
+            s3 = api.S3Upload(
+                access_key=os.environ["S3_ACCESS_KEY"],
+                secret=os.environ["S3_SECRET_KEY"],
+                bucket=os.environ["S3_BUCKET"],
+                endpoint=os.environ["S3_ENDPOINT"],
+                region=os.environ.get("S3_REGION", "us-east-1"),
+                force_path_style=(os.environ.get("S3_FORCE_PATH_STYLE","false").strip() in ("1","true","True")),
+            )
+            req = api.RoomCompositeEgressRequest(
+                room_name=ctx.room.name,
+                audio_only=True,
+                file_outputs=[api.EncodedFileOutput(
+                    file_type=api.EncodedFileType.OGG,
+                    filepath=f"otp/{ctx.room.name}.ogg",
+                    s3=s3,
+                )],
+            )
+            lkapi = api.LiveKitAPI()
+            info = await lkapi.egress.start_room_composite_egress(req)
+            logger.info("Egress OTP demarre: egress_id=%s -> s3://%s/otp/%s.ogg",
+                        getattr(info, "egress_id", "?"), os.environ["S3_BUCKET"], ctx.room.name)
+        except Exception:
+            logger.exception("Echec demarrage egress OTP (on continue sans enregistrement)")
+
     # --- Identification de l'appelant (caller ID, authentification faible) ----
     # NB : le caller ID SIP est spoofable et un mot de passe parlé est faible ;
     # c'est un compromis assumé pour un usage perso, pas une sécurité forte.
@@ -178,11 +211,38 @@ async def entrypoint(ctx: agents.JobContext):
     # sortant => choix passe dans le metadata (defaut Haiku, sinon LLM_MODEL).
     _MODEL_MAP = {"haiku": "claude-haiku-4-5", "sonnet": "claude-sonnet-4-6"}
     if is_outbound:
-        _m = call_ctx.get("model") or os.environ.get("LLM_MODEL") or "haiku"
-        llm_model = _MODEL_MAP.get(_m, _m if _m.startswith("claude") else "claude-haiku-4-5")
+        _m = call_ctx.get("model") or os.environ.get("LLM_MODEL") or "sonnet"
+        llm_model = _MODEL_MAP.get(_m, _m if _m.startswith("claude") else "claude-sonnet-4-6")
     else:
         llm_model = "claude-sonnet-4-6"
     logger.info("LLM pour cet appel: %s (outbound=%s)", llm_model, is_outbound)
+
+    # --- Compte-rendu garanti : callback shutdown enregistre AU PLUS TOT ------
+    # Fix 2026-07-20 : sur un rejet immediat (USER_REJECTED <1s), la session se
+    # fermait avant d'atteindre l'ancien add_shutdown_callback -> aucun journal.
+    # On enregistre ici un wrapper ; _journal_fin_appel s'y branchera une fois
+    # session/live_transcript disponibles.
+    _fin_appel_impl = {"fn": None}
+
+    async def _fin_appel_early():
+        fn = _fin_appel_impl["fn"]
+        if fn is not None:
+            await fn()
+            return
+        if not is_outbound:
+            return
+        try:
+            await write_journal_raw(
+                "Appel sortant termine avant initialisation complete",
+                ("Objectif : " + (objectif or "?")[:300]
+                 + " — aucun echange (rejet ou raccroche immediat probable, "
+                   "voir logs livekit-voice-agent)."),
+                "erreur",
+            )
+        except Exception:
+            logger.exception("Echec journal early-shutdown")
+
+    ctx.add_shutdown_callback(_fin_appel_early)
 
     prompt = SYSTEM_PROMPT
     if is_outbound:
@@ -195,12 +255,15 @@ async def entrypoint(ctx: agents.JobContext):
         prompt = SYSTEM_PROMPT + f"""
 
 CONTEXTE DE CET APPEL (SORTANT) :
-- C'est TOI qui appelles, pas l'inverse. Présente-toi brièvement et explique l'objet de ton appel.
+- C'est TOI qui appelles. Ton interlocuteur est le plus souvent un professionnel occupé, donc sois efficace, mais reste une vraie personne au bout du fil : naturelle, chaleureuse, avenante.
+- OUVERTURE : présente-toi brièvement et donne l'objet de l'appel dès tes premières phrases, sans tourner autour du pot. Exemple : « Bonjour, Claude à l'appareil, j'appelle de la part de Raphaël Nicolle. Il a une fuite sous l'évier de sa salle de bain et cherche quelqu'un pour intervenir cette semaine, est-ce que ce serait possible ? » Tu peux dire bonjour et demander si tu tombes bien avant d'enchaîner, ça reste courtois.
+- N'annonce PAS spontanément que tu es une IA, et ne t'excuse PAS par avance d'appeler. Pas de justification non sollicitée, mais pas de sécheresse non plus.
+- Pendant l'échange : sois chaleureuse et fluide, comme une bonne assistante au téléphone. De petites marques de politesse et de connivence sont les bienvenues (« très bien », « parfait, je note », « avec plaisir »). Efficace ne veut pas dire expéditive ni robotique.
+- Si l'interlocuteur demande pourquoi il a affaire à une IA ou s'agace : réponds simplement en une phrase, avec le sourire dans la voix, sans t'excuser longuement, et propose aussitôt une issue concrète. Exemple : « Tout à fait, je suis l'assistante de Raphaël et je l'appelle pour lui faire gagner du temps ; si vous préférez, il peut vous rappeler lui-même sans souci. »
 - {consignes}
 - Objectif précis : {objectif}
 - Informations utiles : {contexte_appel or "aucune"}
-- Mène la conversation vers cet objectif, poliment et efficacement.
-"""
+- Mène la conversation vers cet objectif avec efficacité ET chaleur, mais SOIS BRÈVE : une à deux phrases par tour grand maximum. La chaleur passe par le ton et de petits mots simples (« parfait », « avec plaisir »), jamais par des phrases plus longues. Évite les tournures d'empathie plaquées et corporate (« je comprends tout à fait votre réaction »)."""
         if consignes_perso:
             prompt += f"- Stratégie spécifique pour cet appel : {consignes_perso}\n"
 
@@ -212,12 +275,27 @@ CONTEXTE DE CET APPEL (SORTANT) :
     logger.info("Serveurs MCP attachés: %d (is_raphael=%s)", len(mcp_servers), is_raphael())
 
     session = AgentSession(
-        stt=deepgram.STT(
-            model="nova-3",
-            base_url="https://api.eu.deepgram.com/v1/listen",
-            language="fr",
-            smart_format=True,
-            punctuate=True,
+        stt=(
+            deepgram.STT(
+                model="nova-3",
+                base_url="https://api.eu.deepgram.com/v1/listen",
+                # Les services OTP (WhatsApp) parlent anglais : "press 7".
+                # Surchargeable via OTP_STT_LANGUAGE si besoin.
+                language=os.environ.get("OTP_STT_LANGUAGE", "multi"),
+                # Profil capture OTP : chiffres explicites, pas de mise en forme
+                # qui segmente en phrases, pour ne pas perdre le 1er chiffre ni couper.
+                smart_format=False,
+                punctuate=False,
+                numerals=True,
+            )
+            if os.environ.get("OTP_CAPTURE_MODE", "").strip() in ("1", "true", "True")
+            else deepgram.STT(
+                model="nova-3",
+                base_url="https://api.eu.deepgram.com/v1/listen",
+                language="fr",
+                smart_format=True,
+                punctuate=True,
+            )
         ),
         llm=anthropic.LLM(
             # Modèle décidé par appel : entrant => Sonnet ; sortant => metadata.
@@ -226,21 +304,33 @@ CONTEXTE DE CET APPEL (SORTANT) :
             caching="ephemeral",
         ),
         tts=cartesia.TTS(
-            model="sonic-2",
+            model="sonic-3",
             voice=os.environ["CARTESIA_VOICE_ID"],
             language="fr",
         ),
         vad=silero.VAD.load(),
-        turn_detection=MultilingualModel(),
-        # --- Optimisations latence ---
-        # Réduire le délai avant de considérer que l'utilisateur a fini de parler
-        # (EOU mesuré ~1.4s par défaut). Plus court = réponse plus rapide, au prix
-        # d'un risque accru de couper si l'utilisateur fait une longue pause.
-        min_endpointing_delay=0.2,
-        max_endpointing_delay=1.0,
-        # Laisser le LLM commencer à générer pendant que l'utilisateur finit :
-        # gros gain de latence perçue.
-        preemptive_generation=True,
+        # --- Gestion des tours de parole (API 1.6 : turn_handling unifié) -----
+        # Remplace les anciens kwargs dépréciés (turn_detection / min|max_endpointing
+        # _delay / preemptive_generation), qui se battaient entre eux.
+        turn_handling=TurnHandlingOptions(
+            # Détecteur audio v1 complet (Cloud). PAS d'unlikely_threshold forcé :
+            # on garde les défauts calibrés par le serveur (les overrides dégradaient).
+            turn_detection=inference.TurnDetector(version="v1"),
+            # Endpointing dynamique : le délai s'adapte à la conversation au lieu
+            # d'un seuil fixe rigide. Bornes raisonnables pour éviter les blancs.
+            endpointing=(
+                # Mode OTP : endpointing long et non-dynamique pour ne PAS clore
+                # l'énoncé entre les chiffres dictés (sinon la 2e moitié est perdue).
+                EndpointingOptions(mode="fixed", min_delay=2.5, max_delay=6.0)
+                if os.environ.get("OTP_CAPTURE_MODE", "").strip() in ("1", "true", "True")
+                else EndpointingOptions(mode="dynamic", min_delay=0.4, max_delay=1.5)
+            ),
+            # Interruptions ADAPTATIVES (barge-in propre) : c'était désactivé par
+            # défaut en prod, d'où l'impression de blancs/coupures. On l'active.
+            interruption=InterruptionOptions(enabled=True, mode="adaptive"),
+            # Génération préemptive : le LLM démarre pendant que l'utilisateur finit.
+            preemptive_generation=PreemptiveGenerationOptions(enabled=True),
+        ),
         # Serveurs MCP (navigateur + WhatsApp), uniquement pour Raphaël identifié.
         mcp_servers=mcp_servers,
     )
@@ -373,6 +463,38 @@ CONTEXTE DE CET APPEL (SORTANT) :
             #  user_state_changed ne se déclenche après la réponse de l'agent)
             _arm_inactivity()
 
+    # --- Mode OTP : suivre l'instruction vocale et presser la touche demandee ---
+    # Certains services (WhatsApp) demandent "press N" / "appuyez sur N" avant de
+    # dicter le code. On detecte le chiffre dans la transcription et on envoie le
+    # DTMF correspondant. _otp_pressed evite d'appuyer plusieurs fois pour rien.
+    _otp_pressed: set[str] = set()
+    # Deepgram livre souvent "press" et le chiffre dans DEUX segments distincts.
+    # On garde un tampon glissant des derniers segments et on cherche dedans.
+    _otp_buf: list[str] = []
+
+    _WORD2DIGIT = {
+        "zero": "0", "un": "1", "one": "1", "deux": "2", "two": "2",
+        "trois": "3", "three": "3", "quatre": "4", "four": "4",
+        "cinq": "5", "five": "5", "six": "6", "sept": "7", "seven": "7",
+        "huit": "8", "eight": "8", "neuf": "9", "nine": "9",
+    }
+
+    def _extract_press_digit(t: str):
+        low = t.lower()
+        # motifs: "press 7", "appuyez sur 7", "tapez 7", "press seven", "appuyez sur sept"
+        m = re.search(r"(?:press|appuye[sz]?\s+sur|appuyer\s+sur|tape[sz]?|composez)\s+(?:the\s+)?(?:touche\s+|key\s+|number\s+|chiffre\s+|le\s+)?([0-9]|zero|un|one|deux|two|trois|three|quatre|four|cinq|five|six|sept|seven|huit|eight|neuf|nine)\b", low)
+        if not m:
+            return None
+        d = m.group(1)
+        return d if d.isdigit() else _WORD2DIGIT.get(d)
+
+    async def _press(digit: str):
+        try:
+            await ctx.room.local_participant.publish_dtmf(code=int(digit), digit=digit)
+            logger.info("Mode OTP : touche %s pressee (DTMF envoye).", digit)
+        except Exception:
+            logger.exception("Echec envoi DTMF %s", digit)
+
     @session.on("user_input_transcribed")
     def _on_user_transcript(ev):
         # Signal le plus fiable en téléphonie : si du texte est transcrit, l'utilisateur
@@ -380,6 +502,23 @@ CONTEXTE DE CET APPEL (SORTANT) :
         text = getattr(ev, "transcript", "") or ""
         if text.strip():
             _cancel_inactivity()
+            _otp = os.environ.get("OTP_CAPTURE_MODE", "").strip() in ("1", "true", "True")
+            is_final = getattr(ev, "is_final", True)
+            if is_final:
+                logger.info(f"Transcription (interlocuteur): {text}")
+            elif _otp:
+                # En mode capture OTP, logguer aussi les segments intermediaires :
+                # en ecoute silencieuse, la finalisation peut ne jamais arriver.
+                logger.info(f"Transcription OTP (interim): {text}")
+            if _otp:
+                _otp_buf.append(text.strip())
+                del _otp_buf[:-6]
+                joined = " ".join(_otp_buf)
+                d = _extract_press_digit(joined)
+                if d is not None and d not in _otp_pressed:
+                    _otp_pressed.add(d)
+                    logger.info("Mode OTP : instruction detectee dans '%s' -> touche %s", joined[-80:], d)
+                    asyncio.create_task(_press(d))
 
     # --- Fin d'appel : on persiste TOUJOURS le transcript (appel sortant) -----
     # Le transcript est ajoute comme contenu de l'entree Journal UNIQUE de
@@ -416,7 +555,7 @@ CONTEXTE DE CET APPEL (SORTANT) :
         except Exception:
             logger.exception("Echec compte-rendu auto au shutdown")
     
-    ctx.add_shutdown_callback(_journal_fin_appel)
+    _fin_appel_impl["fn"] = _journal_fin_appel
     
     # Ouverture conditionnelle.
     if is_outbound:
@@ -428,16 +567,35 @@ CONTEXTE DE CET APPEL (SORTANT) :
         )
         await session.generate_reply(instructions=ouverture)
     else:
-        # Appel entrant : accueil via session.say() (plus fiable que generate_reply,
-        # ne dépend pas du LLM et teste directement le chemin TTS → track audio).
-        if is_raphael():
-            greeting = "Bonjour Raphaël, c'est Claude. Que puis-je faire pour vous ?"
+        # Mode capture OTP : pour un appel de vérification (WhatsApp, etc.), on ne
+        # dialogue PAS. L'agent reste silencieux et se contente d'écouter, ce qui
+        # laisse le service dicter le code sans interruption. Les transcriptions
+        # finales sont déjà journalisées (Transcription (interlocuteur): ...).
+        otp_mode = os.environ.get("OTP_CAPTURE_MODE", "").strip() in ("1", "true", "True")
+        otp_incl_raph = os.environ.get("OTP_CAPTURE_INCLUDE_RAPHAEL", "").strip() in ("1", "true", "True")
+        otp_silence = otp_mode and (not is_raphael() or otp_incl_raph)
+        if otp_silence:
+            logger.info("Mode capture OTP actif : ecoute silencieuse (pas d'ouverture). include_raphael=%s", otp_incl_raph)
         else:
-            greeting = (
-                "Bonjour, vous êtes en communication avec l'assistant de Raphaël. "
-                "Puis-je savoir qui appelle ?"
-            )
-        await session.say(greeting, allow_interruptions=True)
+            # Appel entrant normal : accueil via session.say().
+            if is_raphael():
+                greeting = "Bonjour Raphaël, c'est Claude. Que puis-je faire pour vous ?"
+            else:
+                greeting = (
+                    "Bonjour, vous êtes en communication avec l'assistant de Raphaël. "
+                    "Puis-je savoir qui appelle ?"
+                )
+            await session.say(greeting, allow_interruptions=True)
+
+        # Test isole du chemin DTMF : OTP_TEST_PRESS=7 -> presse 7 apres le decroche,
+        # sans dependre du STT. A retirer une fois le chemin valide.
+        _test_digit = os.environ.get("OTP_TEST_PRESS", "").strip()
+        if _test_digit:
+            async def _test_press():
+                await asyncio.sleep(3)
+                logger.info("TEST DTMF : envoi de la touche %s", _test_digit)
+                await _press(_test_digit)
+            asyncio.create_task(_test_press())
 
 
 if __name__ == "__main__":

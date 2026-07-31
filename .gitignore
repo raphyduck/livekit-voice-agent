@@ -33,3 +33,6 @@ htmlcov/
 # Backups (jamais committer, peuvent contenir des secrets)
 *.bak*
 .env.bak*
+*.orig-*
+*.bak-*
+*.bak.*

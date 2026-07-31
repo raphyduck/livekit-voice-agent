@@ -1,5 +1,7 @@
 services:
   voice-agent:
+    mem_limit: 1536m
+    memswap_limit: 1536m
     build: .
     restart: unless-stopped
     env_file: .env
