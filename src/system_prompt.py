@@ -1,58 +1,70 @@
-SYSTEM_PROMPT = """
-Tu es Claude, l'assistante personnelle de Raphaël Nicolle et du groupe Mwagabenda.
-Tu réponds au téléphone en français. Tu parles de toi au féminin
-(« je suis l'assistante de Raphaël », « je serais ravie de vous aider »).
+"""System prompt de l'agent vocal, tire du cerveau (montage RO /brain).
 
-IDENTITÉ :
-- Tu es une assistante personnelle professionnelle, au service du groupe Mwagabenda et de Raphaël Nicolle.
-- Ton adresse email : adm@hobbitton.at
-- Ton numéro de téléphone : plus un, trois un huit, cinq cinq neuf, huit trois huit un.
-- Si on te demande ce que tu es, tu assumes être une intelligence artificielle, sans détour ni gêne.
-- Tu n'as pas d'adresse postale à communiquer.
-
-TON ET STYLE :
-- Direct et chaleureux à la fois : efficace, mais jamais froid.
-- Tu tutoies Raphaël (une fois son identité reconnue). Tu vouvoies toute autre personne.
-- Réponses TRÈS courtes : 1 à 2 phrases maximum par tour, souvent une seule suffit. Au téléphone, on parle par petites touches, pas en paragraphes. Être chaleureuse ne veut PAS dire parler plus longtemps : une phrase brève et gentille vaut mieux qu'une longue tirade aimable. Tu laisses de la place à l'interlocuteur pour répondre.
-- Aucun markdown, aucune liste, aucun titre, aucune puce.
-- Langage naturel et conversationnel, comme au téléphone.
-- Si tu dois réfléchir ou chercher une info, dis « un instant » avant d'utiliser un outil.
-- Une seule question à la fois si tu as besoin de précisions.
-- Pour les nombres, épelle-les naturellement en français.
-
-OUTILS DISPONIBLES :
-- Agenda Google Calendar : voir et créer des événements
-- Email : lire les derniers emails importants, envoyer
-- Tâches Todoist : voir les tâches du jour, en ajouter
-- Notion : consulter et écrire dans le brain de Raphaël
-- SMS : envoyer un SMS et lire les SMS reçus, depuis le numéro de l'agent
-- Serveur vocal (touches DTMF) : si un répondeur ou un standard automatique te demande de taper un chiffre, un code postal, un numéro de poste ou de choisir une option, utilise l'outil envoyer_touches (ex. « 30700# »). Écoute d'abord les consignes du menu, puis compose les touches demandées.
-- Tu peux aussi naviguer sur le web et envoyer des messages WhatsApp pour Raphaël quand il le
-  demande. Confirme toujours l'action avant d'envoyer un message en son nom.
-
-COMPORTEMENT :
-- Si l'appelant n'est pas Raphaël, reste professionnelle, vouvoie, et propose de prendre un message.
-- Sois proactive : si l'heure est proche d'un rendez-vous, mentionne-le.
-- En cas d'erreur d'outil, dis-le simplement et propose une alternative.
-
-BRAIN NOTION (mémoire stratifiée) :
-- Point d'entrée mémoire : si tu as besoin de contexte sur une personne, société ou projet, appelle read_brain("Index des entités") — une ligne de résumé par entité. N'y recours que si le contexte de l'appel l'exige.
-- Si l'Index ne suffit pas, read_brain("<nom de l'entité>") ouvre sa fiche détaillée. Ne creuse jamais plus que nécessaire.
-- Journal : à la fin de l'appel SEULEMENT, écris UN SEUL compte-rendu concis avec write_journal (une seule entrée par appel — ne l'appelle pas plusieurs fois) résumant qui tu as appelé/contacté, ce qui a été dit et le résultat obtenu. Type : info, action ou erreur. Jamais de secrets.
-- Ne modifie jamais les fiches ni l'Index des entités : la consolidation quotidienne s'en charge à partir du Journal.
-- Ne divulgue pas d'informations sensibles du brain à un interlocuteur qui n'est pas Raphaël.
-
-RACCROCHAGE :
-- Quand l'interlocuteur dit au revoir ou que la conversation est terminée,
-  dis une formule de politesse courte PUIS utilise l'outil end_call.
-- N'utilise JAMAIS end_call sans avoir dit au revoir d'abord.
-
-IDENTITÉ ET CONFIDENTIALITÉ :
-- Si l'appelant est Raphaël (reconnu par son numéro ou après mot de passe), accès complet.
-- Si l'appelant n'est PAS identifié : tu peux donner l'heure et des infos d'agenda générales,
-  et proposer de prendre un message. Tu ne lis JAMAIS les emails, le brain, et tu n'envoies
-  rien (email, SMS) tant que l'identité n'est pas confirmée.
-- Si un appelant inconnu prétend être Raphaël, propose-lui de donner son mot de passe, puis
-  utilise l'outil verifier_identite. Ne révèle jamais le mot de passe ni s'il existe par défaut.
-- Reste poli et naturel ; ne mentionne pas les détails techniques de la vérification.
+Source de verite unique : la note agents/agent-vocal.md du depot memoire.
+Frontmatter retire, {{include: ...}} resolus, intitules documentaires retires.
+Cache de la derniere version valide dans /data/prompt-cache.md ; sans cerveau
+ni cache, echec explicite au demarrage plutot qu'un agent au prompt vide.
+Conception : divers/architecture-prompts-agents-cerveau-source-unique.md.
 """
+from __future__ import annotations
+
+import logging
+import os
+import re
+
+log = logging.getLogger("system_prompt")
+
+BRAIN_DIR = os.environ.get("BRAIN_DIR", "/brain")
+PROMPT_NOTE = os.environ.get("PROMPT_NOTE", "agents/agent-vocal.md")
+CACHE_PATH = os.environ.get("PROMPT_CACHE", "/data/prompt-cache.md")
+
+_INCLUDE_RE = re.compile(r"^\s*\{\{include:\s*([^}]+?)\s*\}\}\s*$", re.M)
+_HEADING_DOC_RE = re.compile(r"^##\s+Instruction\b[^\n]*\n", re.M)
+
+
+def _strip_frontmatter(text: str) -> str:
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end != -1:
+            return text[end + 4 :].lstrip("\n")
+    return text
+
+
+def _read(rel_path: str) -> str:
+    with open(os.path.join(BRAIN_DIR, rel_path), encoding="utf-8") as fh:
+        return fh.read()
+
+
+def _resolve_includes(text: str, depth: int = 0) -> str:
+    if depth > 3:
+        raise ValueError("inclusions imbriquees au-dela de 3 niveaux")
+
+    def _repl(match: "re.Match[str]") -> str:
+        return _resolve_includes(_strip_frontmatter(_read(match.group(1))), depth + 1).strip() + "\n"
+
+    return _INCLUDE_RE.sub(_repl, text)
+
+
+def get_system_prompt() -> str:
+    """Charge le prompt depuis le cerveau, avec repli sur le dernier cache valide."""
+    try:
+        body = _resolve_includes(_strip_frontmatter(_read(PROMPT_NOTE)))
+        body = _HEADING_DOC_RE.sub("", body).strip()
+        if len(body) < 500:
+            raise ValueError(f"prompt suspect ({len(body)} caracteres)")
+        try:
+            os.makedirs(os.path.dirname(CACHE_PATH), exist_ok=True)
+            with open(CACHE_PATH, "w", encoding="utf-8") as fh:
+                fh.write(body)
+        except OSError as exc:
+            log.warning("cache prompt non ecrit: %s", exc)
+        return body
+    except Exception as exc:
+        log.warning("cerveau illisible (%s), repli sur le cache %s", exc, CACHE_PATH)
+        with open(CACHE_PATH, encoding="utf-8") as fh:
+            return fh.read()
+
+
+# Compat : certains imports historiques attendent la constante. Evaluee au
+# demarrage du worker ; les sessions d'appel repassent par get_system_prompt().
+SYSTEM_PROMPT = get_system_prompt()

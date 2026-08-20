@@ -16,7 +16,7 @@ from livekit.agents import (
 from livekit.agents.voice.turn import InterruptionOptions, PreemptiveGenerationOptions
 from livekit.plugins import anthropic, cartesia, deepgram, silero
 
-from .system_prompt import SYSTEM_PROMPT
+from .system_prompt import get_system_prompt
 from .tools import (
     add_task,
     create_calendar_event,
@@ -244,7 +244,7 @@ async def entrypoint(ctx: agents.JobContext):
 
     ctx.add_shutdown_callback(_fin_appel_early)
 
-    prompt = SYSTEM_PROMPT
+    prompt = get_system_prompt()
     if is_outbound:
         consignes = {
             "rdv": "Tu appelles pour prendre, décaler ou annuler un rendez-vous.",
@@ -252,7 +252,7 @@ async def entrypoint(ctx: agents.JobContext):
             "message": "Tu appelles pour laisser un message à transmettre.",
             "relance": "Tu appelles pour relancer sur un sujet en attente.",
         }.get(scenario, "")
-        prompt = SYSTEM_PROMPT + f"""
+        prompt = prompt + f"""
 
 CONTEXTE DE CET APPEL (SORTANT) :
 - C'est TOI qui appelles. Ton interlocuteur est le plus souvent un professionnel occupé, donc sois efficace, mais reste une vraie personne au bout du fil : naturelle, chaleureuse, avenante.
