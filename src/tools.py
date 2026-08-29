@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -39,14 +40,19 @@ def is_raphael() -> bool:
 
 # Etat par appel : un compte-rendu a-t-il deja ete ecrit ?
 # journal_page_id : id de la page Journal creee pour CET appel (idempotence).
-# journal_detail  : texte deja consigne, pour fusionner sans relire Notion.
-_CALL_STATE = {"journal_written": False, "journal_page_id": None, "journal_detail": ""}
+# journal_detail  : texte accumule pendant l'appel, ecrit en une seule entree
+#                   a la fin (le journal du cerveau est append-only).
+# journal_title   : titre de l'entree unique de cet appel.
+_CALL_STATE = {"journal_written": False, "journal_page_id": None,
+               "journal_detail": "", "journal_title": "", "journal_type": "info"}
 
 
 def reset_call_state() -> None:
     _CALL_STATE["journal_written"] = False
     _CALL_STATE["journal_page_id"] = None
     _CALL_STATE["journal_detail"] = ""
+    _CALL_STATE["journal_title"] = ""
+    _CALL_STATE["journal_type"] = "info"
 
 
 def journal_was_written() -> bool:
@@ -273,172 +279,177 @@ async def add_task(content: str, due_string: str = "aujourd'hui") -> str:
 
 
 # ---------------------------------------------------------------------------
-# Notion (API directe)
+# Cerveau hobbitton (lecture : montage RO /brain ; ecriture : MCP memoire)
 # ---------------------------------------------------------------------------
+# Historique : cette section tapait l'API Notion en direct. Depuis le
+# 24/08/2026 la source de verite est le depot memoire (hobbitton-memory).
+# Lecture = fichiers du montage /brain, sans reseau : c'est ce qui tient la
+# latence d'un appel telephonique. Ecriture = outil `journaliser` du MCP
+# memoire, qui produit le commit git signe et respecte l'append-only.
 
-_NOTION_VERSION = "2022-06-28"
-# Base "Journal" du brain (append-only ; l'agent y écrit ses traces d'activité).
-_JOURNAL_DB_ID = "091cce0e-375e-4a51-a310-3592c359bcd1"
+_BRAIN_DIR = os.environ.get("BRAIN_DIR", "/brain")
+_MEMORY_MCP_URL = os.environ.get("MEMORY_MCP_URL", "http://127.0.0.1:8091/mcp")
 _JOURNAL_TYPES = {"info", "action", "erreur", "décision requise"}
 
 
-def _notion_headers() -> dict:
-    return {
-        "Authorization": f"Bearer {os.environ['NOTION_API_KEY']}",
-        "Notion-Version": _NOTION_VERSION,
-        "Content-Type": "application/json",
+def _brain_path(*parts) -> str:
+    return os.path.join(_BRAIN_DIR, *parts)
+
+
+def _read_note(rel: str, limit: int = 4000) -> str:
+    try:
+        with open(_brain_path(rel), encoding="utf-8") as fh:
+            return fh.read(limit)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+async def _memory_call(tool: str, arguments: dict, timeout: float = WRITE_TIMEOUT) -> str:
+    """Appelle un outil du MCP memoire. Renvoie le texte du resultat.
+
+    Le transport rend du SSE : une ou plusieurs lignes `data: {json}`.
+    """
+    payload = {
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": tool, "arguments": arguments},
     }
-
-
-def _extract_notion_title(page: dict) -> str:
-    props = page.get("properties", {})
-    for prop in props.values():
-        if prop.get("type") == "title":
-            title_parts = prop.get("title", [])
-            if title_parts:
-                return title_parts[0].get("plain_text", "?")
-    # Fallback pour les résultats de type "database" ou titre au niveau racine.
-    title_parts = page.get("title", [])
-    if title_parts:
-        return title_parts[0].get("plain_text", "?")
-    return "Sans titre"
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.post(_MEMORY_MCP_URL, headers=headers, json=payload)
+        r.raise_for_status()
+        body = r.text
+    for line in body.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        import json as _json
+        data = _json.loads(line[5:].strip())
+        if "error" in data:
+            raise RuntimeError(str(data["error"]))
+        content = data.get("result", {}).get("content") or []
+        if content:
+            return content[0].get("text", "")
+        return ""
+    raise RuntimeError("reponse MCP memoire illisible")
 
 
 @function_tool()
 async def read_brain(query: str) -> str:
-    """Consulte le cerveau (brain) Notion de Raphaël : profil, agents, journal, items ouverts.
+    """Consulte le cerveau de Raphael : profil, entites, procedures, items ouverts.
 
-    Renvoie le contenu des entrées les plus pertinentes, pas seulement les titres.
+    Renvoie le contenu des passages les plus pertinents, pas seulement les titres.
 
     Args:
-        query: Termes à rechercher (sujet, nom d'agent, infra, etc.).
+        query: Termes a rechercher (sujet, nom d'entite, infra, etc.).
     """
     if not is_raphael():
         return _ACCESS_DENIED
-    headers = _notion_headers()
     try:
-        async with httpx.AsyncClient(timeout=READ_TIMEOUT) as client:
-            r = await client.post(
-                "https://api.notion.com/v1/search",
-                headers=headers,
-                json={"query": query, "page_size": 3},
-            )
-            r.raise_for_status()
-            results = r.json().get("results", [])
-            if not results:
-                return "Aucun résultat dans le brain."
-
-            out = []
-            for page in results[:3]:
-                title = _extract_notion_title(page)
-                pid = page.get("id")
-
-                # Récupérer le contenu (blocks) de la page.
-                text_parts = []
-                try:
-                    br = await client.get(
-                        f"https://api.notion.com/v1/blocks/{pid}/children?page_size=20",
-                        headers=headers,
-                    )
-                    br.raise_for_status()
-                    for blk in br.json().get("results", []):
-                        t = blk.get(blk.get("type"), {})
-                        for rt in t.get("rich_text", []):
-                            text_parts.append(rt.get("plain_text", ""))
-                except Exception:  # noqa: BLE001
-                    pass
-
-                # Inclure aussi les valeurs des propriétés texte/select de la page.
-                props = page.get("properties", {})
-                prop_bits = []
-                for _name, p in props.items():
-                    ptype = p.get("type")
-                    if ptype == "rich_text":
-                        prop_bits.append(
-                            " ".join(rt.get("plain_text", "") for rt in p.get("rich_text", []))
-                        )
-                    elif ptype == "select" and p.get("select"):
-                        prop_bits.append(p["select"].get("name", ""))
-
-                body = " ".join(b for b in (prop_bits + text_parts) if b).strip()
-                out.append(f"{title} : {body[:600]}" if body else title)
-            return "\n\n".join(out)
+        terms = [t.lower() for t in re.findall(r"\w{3,}", query or "")][:6]
+        out = []
+        index = _read_note("index.md", 3500)
+        if index:
+            out.append("INDEX DU CERVEAU\n" + index)
+        if terms:
+            hits = []
+            for racine, dirs, fichiers in os.walk(_BRAIN_DIR):
+                dirs[:] = [d for d in dirs if d not in (".git", "journal")]
+                for f in fichiers:
+                    if not f.endswith(".md"):
+                        continue
+                    chemin = os.path.join(racine, f)
+                    rel = os.path.relpath(chemin, _BRAIN_DIR)
+                    if rel == "index.md":
+                        continue
+                    try:
+                        with open(chemin, encoding="utf-8") as fh:
+                            texte = fh.read()
+                    except Exception:  # noqa: BLE001
+                        continue
+                    bas = texte.lower()
+                    score = sum(bas.count(t) for t in terms)
+                    if score:
+                        pos = min((bas.find(t) for t in terms if bas.find(t) >= 0),
+                                  default=0)
+                        debut = max(0, pos - 200)
+                        hits.append((score, rel, texte[debut:debut + 1200]))
+            hits.sort(key=lambda h: -h[0])
+            for _score, rel, extrait in hits[:3]:
+                out.append(rel + "\n" + extrait)
+        if not out:
+            return "Je n'ai rien trouve dans le cerveau sur ce sujet."
+        return "\n\n---\n\n".join(out)[:6000]
     except Exception as e:  # noqa: BLE001
         logger.exception("Erreur read_brain")
-        return f"Je n'ai pas pu consulter le brain : {e}"
+        return f"Je n'ai pas pu consulter le cerveau : {e}"
+
+
+async def flush_journal() -> bool:
+    """Ecrit UNE entree de journal pour l'appel en cours, puis vide le tampon.
+
+    Le journal du cerveau est append-only : on ne peut pas corriger une entree
+    deja ecrite. On accumule donc tout pendant l'appel et on ecrit une seule
+    fois, a la fin. Renvoie True si une entree a ete ecrite.
+    """
+    tampon = _CALL_STATE.get("journal_detail") or ""
+    titre = _CALL_STATE.get("journal_title") or ""
+    if not (tampon or titre):
+        return False
+    entree = titre
+    if tampon:
+        entree = (titre + " — " + tampon) if titre else tampon
+    try:
+        await _memory_call("journaliser", {
+            "entree": entree[:12000],
+            "auteur": "agent vocal (LiveKit)",
+            "tags": ["appel", _CALL_STATE.get("journal_type") or "info"],
+        })
+        _CALL_STATE["journal_detail"] = ""
+        _CALL_STATE["journal_title"] = ""
+        return True
+    except Exception:  # noqa: BLE001
+        logger.exception("Erreur flush_journal")
+        return False
 
 
 async def write_journal_raw(action: str, detail: str = "", type: str = "info") -> str:
-    """Ajoute une entrée au Journal du brain Notion de Raphaël (trace d'activité).
+    """Note une trace d'activite pour l'appel en cours.
 
-    À utiliser pour consigner une action faite ou une info importante issue de l'appel.
+    N'ecrit PAS tout de suite : le journal du cerveau est append-only, donc on
+    accumule et on ecrit une entree unique en fin d'appel (flush_journal).
 
     Args:
-        action: Résumé court de ce qui s'est passé (titre).
-        detail: Détails complémentaires (optionnel).
-        type: Catégorie : 'info', 'action', 'erreur' ou 'décision requise'.
+        action: Resume court de ce qui s'est passe.
+        detail: Details complementaires (optionnel).
+        type: Categorie : 'info', 'action', 'erreur' ou 'decision requise'.
     """
-    # NB : write_journal n'est PAS gardé par is_raphael(). Le journal est une
-    # trace interne (jamais lue à l'appelant) et doit rester disponible sur les
-    # appels SORTANTS pour le compte-rendu de fin d'appel.
+    # NB : pas de garde is_raphael() ici. Le journal est une trace interne,
+    # jamais lue a l'appelant, et doit rester disponible sur les appels sortants.
     if type not in _JOURNAL_TYPES:
         type = "info"
-
-    # Idempotence par appel : si une entree a deja ete creee pour CET appel,
-    # on MET A JOUR cette page (fusion du Detail) au lieu d'en creer une autre.
-    existing_id = _CALL_STATE["journal_page_id"]
-    if existing_id:
-        prev = _CALL_STATE["journal_detail"]
-        ajout = (action + " — " + detail) if detail else action
-        sep = chr(10) + "— maj : "
-        merged = ((prev + sep + ajout) if prev else ajout)[:1900]
-        payload = {
-            "properties": {
-                "Détail": {"rich_text": [{"text": {"content": merged}}]},
-            },
-        }
-        try:
-            async with httpx.AsyncClient(timeout=WRITE_TIMEOUT) as client:
-                r = await client.patch(
-                    f"https://api.notion.com/v1/pages/{existing_id}",
-                    headers=_notion_headers(), json=payload,
-                )
-                r.raise_for_status()
-            _CALL_STATE["journal_detail"] = merged
-            return "Journal mis à jour (entrée unique de l'appel)."
-        except Exception as e:  # noqa: BLE001
-            logger.exception("Erreur write_journal (maj)")
-            return f"Je n'ai pas pu mettre à jour le journal : {e}"
-
-    payload = {
-        "parent": {"database_id": _JOURNAL_DB_ID},
-        "properties": {
-            "Action": {"title": [{"text": {"content": action[:200]}}]},
-            "Détail": {"rich_text": [{"text": {"content": detail[:1800]}}]},
-            "Source": {"rich_text": [{"text": {"content": "agent vocal"}}]},
-            "Agent": {"rich_text": [{"text": {"content": "Claude (assistant)"}}]},
-            "Type": {"select": {"name": type}},
-        },
-    }
-    try:
-        async with httpx.AsyncClient(timeout=WRITE_TIMEOUT) as client:
-            r = await client.post(
-                "https://api.notion.com/v1/pages", headers=_notion_headers(), json=payload
-            )
-            r.raise_for_status()
-            data = r.json()
+    if not _CALL_STATE.get("journal_title"):
+        _CALL_STATE["journal_title"] = action[:200]
+        _CALL_STATE["journal_type"] = type
+    else:
+        suite = (action + (" — " + detail if detail else ""))
+        prev = _CALL_STATE.get("journal_detail") or ""
+        _CALL_STATE["journal_detail"] = (prev + "\n— maj : " + suite)[:11000]
         _CALL_STATE["journal_written"] = True
-        _CALL_STATE["journal_page_id"] = data.get("id")
-        _CALL_STATE["journal_detail"] = detail[:1800]
-        return "Note ajoutée au journal."
-    except Exception as e:  # noqa: BLE001
-        logger.exception("Erreur write_journal")
-        return f"Je n'ai pas pu écrire dans le journal : {e}"
+        _CALL_STATE["journal_page_id"] = "buffer"
+        return "Note ajoutee au journal de l'appel."
+    if detail:
+        _CALL_STATE["journal_detail"] = detail[:11000]
+    _CALL_STATE["journal_written"] = True
+    _CALL_STATE["journal_page_id"] = "buffer"
+    return "Note ajoutee au journal de l'appel."
 
 
 @function_tool()
 async def write_journal(action: str, detail: str = "", type: str = "info") -> str:
-    """Ajoute une entree au Journal du brain Notion (trace interne)."""
+    """Ajoute une entree au journal du cerveau (trace interne)."""
     return await write_journal_raw(action, detail, type)
 
 
@@ -596,37 +607,15 @@ async def envoyer_touches(touches: str) -> str:
         return "Touches non envoyees : " + str(e)
 
 async def append_journal_transcript(transcript: str) -> None:
-    """Ajoute le transcript de l'appel comme contenu (blocs) de l'entree Journal
-    de CET appel. Cree d'abord l'entree si aucune n'existe (raccroche precoce).
-    Notion limite chaque bloc texte a ~2000 caracteres : on decoupe en morceaux.
+    """Ajoute le transcript a l'entree de journal de CET appel, puis l'ecrit.
+
+    Une seule entree par appel : le titre, les notes prises en cours d'appel et
+    le transcript partent ensemble dans le cerveau (append-only).
     """
-    page_id = _CALL_STATE["journal_page_id"]
-    if not page_id:
-        await write_journal_raw(
-            "Appel sortant - transcript auto",
-            "Compte-rendu automatique : transcript ci-dessous.",
-            "info",
-        )
-        page_id = _CALL_STATE["journal_page_id"]
-        if not page_id:
-            return
     texte = transcript or "(aucun echange capte)"
-    morceaux = [texte[i:i + 1900] for i in range(0, len(texte), 1900)] or [texte]
-    children = [{
-        "object": "block", "type": "heading_3",
-        "heading_3": {"rich_text": [{"text": {"content": "Transcript de l'appel"}}]},
-    }]
-    for m in morceaux[:90]:
-        children.append({
-            "object": "block", "type": "paragraph",
-            "paragraph": {"rich_text": [{"text": {"content": m}}]},
-        })
-    try:
-        async with httpx.AsyncClient(timeout=WRITE_TIMEOUT) as client:
-            r = await client.patch(
-                f"https://api.notion.com/v1/blocks/{page_id}/children",
-                headers=_notion_headers(), json={"children": children},
-            )
-            r.raise_for_status()
-    except Exception:  # noqa: BLE001
-        logger.exception("Erreur append_journal_transcript")
+    if not _CALL_STATE.get("journal_title"):
+        _CALL_STATE["journal_title"] = "Appel - transcript automatique"
+        _CALL_STATE["journal_type"] = "info"
+    prev = _CALL_STATE.get("journal_detail") or ""
+    _CALL_STATE["journal_detail"] = (prev + "\n\nTranscript de l'appel :\n" + texte)[:20000]
+    await flush_journal()
