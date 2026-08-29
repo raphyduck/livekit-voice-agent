@@ -31,6 +31,7 @@ from .tools import (
     is_raphael,
     read_brain,
     reset_identity,
+    set_direction_sortante,
     send_email,
     send_sms,
     lire_sms,
@@ -143,6 +144,12 @@ TOOLS_RESTREINT = [
     end_call,
     verifier_identite,
     envoyer_touches,
+    # Passerelle : elle ne donne RIEN tant que le mot de passe n'est pas
+    # verifie (palier 0 sur un appel sortant), mais sans ces trois outils
+    # Raphael ne peut rien consulter quand c'est l'agent qui l'appelle.
+    lister_connecteurs,
+    lister_outils,
+    utiliser_connecteur,
 ]
 
 
@@ -266,6 +273,7 @@ async def entrypoint(ctx: agents.JobContext):
         logger.exception("metadata room illisible")
 
     is_outbound = call_ctx.get("direction") == "outbound"
+    set_direction_sortante(is_outbound)
     objectif = call_ctx.get("objectif", "")
     scenario = call_ctx.get("scenario", "")
     contexte_appel = call_ctx.get("contexte", "")
@@ -378,6 +386,11 @@ CONTEXTE DE CET APPEL (SORTANT) :
                 # commence a couper la parole.
                 eager_eot_threshold=0.4,
                 eot_threshold=0.7,
+                # Filet de securite quand Flux n'est sur de rien : il conclut la
+                # fin de tour sur silence pur. Defaut du plugin 3000 ms, soit
+                # trois secondes de blanc au telephone. 1200 ms suffit : au-dela
+                # d'une seconde de silence, l'interlocuteur a fini.
+                eot_timeout_ms=int(os.environ.get("FLUX_EOT_TIMEOUT_MS", "1200")),
             )
         ),
         # Modèle décidé par appel : entrant => Sonnet ; sortant => metadata.
@@ -401,14 +414,35 @@ CONTEXTE DE CET APPEL (SORTANT) :
                 if os.environ.get("OTP_CAPTURE_MODE", "").strip() in ("1", "true", "True")
                 else "stt"
             ),
-            # Endpointing dynamique : le délai s'adapte à la conversation au lieu
-            # d'un seuil fixe rigide. Bornes raisonnables pour éviter les blancs.
+            # --- Endpointing : le poste de latence n°1, corrige le 29/08/2026 ---
+            # Diagnostic. Meme en mode "stt", l'agent attend `endpointing.min_delay`
+            # APRES que Flux a decide la fin de tour (audio_recognition.py :
+            # `endpointing_delay = self._endpointing.min_delay`). En mode dynamique
+            # ce min_delay n'est pas la valeur passee ici : il est APPRIS sur les
+            # pauses de l'interlocuteur par un filtre exponentiel (alpha 0.9) qui
+            # monte vers max_delay. Mesure sur deux appels reels du 29/08, meme
+            # configuration :
+            #     appel 11h24 — EOU median 0,72 s dont 0,46 s de transcription
+            #     appel 11h57 — EOU median 1,13 s dont 0,38 s de transcription
+            # La transcription est stable ; c'est l'attente apprise qui passe de
+            # 0,26 s a 0,75 s parce que Raphael avait hesite (phrases hachees),
+            # et le filtre redescend lentement. D'ou l'impression de lenteur
+            # variable d'un appel a l'autre.
+            #
+            # Correction. Cette attente apprise fait doublon avec Flux, qui a deja
+            # tranche semantiquement (eot_threshold 0.7) : on garde un delai FIXE
+            # et court, juste de quoi laisser arriver une transcription tardive.
+            # Le mode dynamique reste justifie sans detecteur semantique.
             endpointing=(
                 # Mode OTP : endpointing long et non-dynamique pour ne PAS clore
                 # l'énoncé entre les chiffres dictés (sinon la 2e moitié est perdue).
                 EndpointingOptions(mode="fixed", min_delay=2.5, max_delay=6.0)
                 if os.environ.get("OTP_CAPTURE_MODE", "").strip() in ("1", "true", "True")
-                else EndpointingOptions(mode="dynamic", min_delay=0.4, max_delay=1.5)
+                else EndpointingOptions(
+                    mode="fixed",
+                    min_delay=float(os.environ.get("EOU_MIN_DELAY", "0.15")),
+                    max_delay=float(os.environ.get("EOU_MAX_DELAY", "0.6")),
+                )
             ),
             # Interruptions ADAPTATIVES (barge-in propre) : c'était désactivé par
             # défaut en prod, d'où l'impression de blancs/coupures. On l'active.

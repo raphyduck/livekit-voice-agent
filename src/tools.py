@@ -1,5 +1,7 @@
+import difflib
 import json
 import os
+import unicodedata
 import asyncio
 import logging
 import re
@@ -32,6 +34,15 @@ _ACCESS_DENIED = (
 )
 
 
+def set_direction_sortante(sortant: bool) -> None:
+    """Memorise le sens de l'appel : la passerelle en depend (voir _palier_courant)."""
+    _IDENTITY["sortant"] = bool(sortant)
+
+
+def est_sortant() -> bool:
+    return bool(_IDENTITY.get("sortant"))
+
+
 def reset_identity(value: bool = False) -> None:
     # is_raphael : presomption (caller ID), falsifiable.
     # mdp_verifie : preuve (mot de passe vocal), le seul fait qui ouvre le
@@ -39,6 +50,8 @@ def reset_identity(value: bool = False) -> None:
     #   du caller ID — sinon usurper un numero suffirait a lire les comptes.
     _IDENTITY["is_raphael"] = value
     _IDENTITY["mdp_verifie"] = False
+    _IDENTITY["sortant"] = False
+    _IDENTITY["essais_mdp"] = 0
 
 
 def is_raphael() -> bool:
@@ -560,6 +573,78 @@ async def end_call() -> str:
 # Vérification d'identité
 # ---------------------------------------------------------------------------
 
+def _normaliser_mdp(texte: str) -> str:
+    """Minuscules, sans accents ni ponctuation, espaces normalises."""
+    t = unicodedata.normalize("NFD", texte.strip().lower())
+    t = "".join(c for c in t if unicodedata.category(c) != "Mn")
+    t = re.sub(r"[^a-z0-9 ]+", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _reduire_phonetique(mot: str) -> str:
+    """Reduction phonetique grossiere du francais, pour comparer des sons.
+
+    Ne vise pas la justesse linguistique : seulement a rapprocher les graphies
+    qu'une reconnaissance vocale confond. Consonnes finales muettes retirees,
+    doubles simplifiees, graphies equivalentes ramenees a une seule.
+    """
+    m = mot
+    for avant, apres in (("ph", "f"), ("qu", "k"), ("gu", "g"), ("ch", "x"),
+                         ("eau", "o"), ("au", "o"), ("ai", "e"), ("ei", "e"),
+                         ("ou", "u"), ("y", "i"), ("c", "k"), ("q", "k"),
+                         ("z", "s"), ("ss", "s")):
+        m = m.replace(avant, apres)
+    m = re.sub(r"(.)\1+", r"\1", m)          # doubles -> simple
+    m = re.sub(r"[tdsxpgz]+$", "", m)         # consonnes finales muettes
+    m = re.sub(r"e$", "", m)                  # e muet final
+    return m or mot
+
+
+def _comparer_mot_de_passe(dit: str, attendu: str) -> str | None:
+    """Compare un mot de passe ENTENDU, pas tape. Rend le mode de correspondance.
+
+    Un mot de passe vocal traverse la reconnaissance vocale avant d'arriver ici :
+    le 29/08/2026, « fleur de lys » est arrive transcrit « fleur de lit » et la
+    comparaison stricte a rejete Raphael avec le bon mot de passe. Comparer au
+    caractere pres revient a exiger que le STT soit parfait, ce qu'il n'est pas.
+
+    On tolere donc l'a-peu-pres de transcription, sans ouvrir la porte :
+      - meme nombre de mots exige (« fleur de lys » ne matche pas « fleur ») ;
+      - au plus UN mot different, et ce mot doit rester tres proche ;
+      - similarite globale >= 0.82.
+    Sur un secret de trois mots cela laisse passer une syllabe mal entendue,
+    pas un mot de passe devine. Le nombre d'essais est borne par ailleurs.
+    """
+    a, b = _normaliser_mdp(dit), _normaliser_mdp(attendu)
+    if not a or not b:
+        return None
+    if a == b:
+        return "exact"
+    ma, mb = a.split(), b.split()
+    if len(ma) != len(mb):
+        return None
+    differents = [(x, y) for x, y in zip(ma, mb) if x != y]
+    if len(differents) > 1:
+        return None
+    if differents:
+        x, y = differents[0]
+        # Comparer les SONS, pas les lettres : c'est une oreille qui a ecrit ce
+        # texte. « lys » et « lit » ne partagent qu'une lettre sur trois mais se
+        # reduisent tous deux a « li » — c'est exactement la confusion qui a
+        # rejete Raphael le 29/08.
+        px, py = _reduire_phonetique(x), _reduire_phonetique(y)
+        if px != py:
+            # Pas le meme son : on tolere encore une lettre de travers, mais
+            # l'attaque du mot doit tenir (le STT se trompe sur la fin, rarement
+            # sur le debut) — sans quoi « coeur » passerait pour « fleur ».
+            if x[:1] != y[:1] or difflib.SequenceMatcher(None, px, py).ratio() < 0.6:
+                return None
+        return "transcription approximative"
+    if difflib.SequenceMatcher(None, a, b).ratio() < 0.82:
+        return None
+    return "transcription approximative"
+
+
 @function_tool()
 async def verifier_identite(mot_de_passe: str) -> str:
     """Vérifie l'identité de l'appelant via un mot de passe.
@@ -571,10 +656,22 @@ async def verifier_identite(mot_de_passe: str) -> str:
         mot_de_passe: Le mot de passe énoncé par l'appelant.
     """
     expected = os.environ.get("RAPHAEL_VOICE_PASSWORD", "")
-    if expected and mot_de_passe.strip().lower() == expected.strip().lower():
+    if not expected:
+        return "Je ne peux pas vérifier d'identité pour le moment."
+
+    # Anti-force brute : le mot de passe passe par un canal ou l'on peut essayer
+    # vite et sans trace. Cinq tentatives par appel, ensuite c'est fini.
+    _IDENTITY["essais_mdp"] = _IDENTITY.get("essais_mdp", 0) + 1
+    if _IDENTITY["essais_mdp"] > 5:
+        logger.warning("Trop de tentatives de mot de passe vocal sur cet appel")
+        return ("Trop de tentatives. Je ne peux plus vérifier d'identité pendant "
+                "cet appel.")
+
+    verdict = _comparer_mot_de_passe(mot_de_passe, expected)
+    if verdict:
         _IDENTITY["is_raphael"] = True
         _IDENTITY["mdp_verifie"] = True
-        logger.info("Identite verifiee par mot de passe vocal (palier 2 ouvert)")
+        logger.info("Identite verifiee par mot de passe vocal (%s), palier 2 ouvert", verdict)
         return "Identité confirmée. Bonjour Raphaël."
     return (
         "Mot de passe incorrect. Je ne peux pas vous donner accès aux "
@@ -645,7 +742,17 @@ from . import connecteurs as _cx
 
 
 def _palier_courant() -> int:
-    """0 = personne d'identifie, 1 = caller ID Raphael, 2 = mot de passe verifie."""
+    """0 = rien, 1 = caller ID de Raphael, 2 = mot de passe verifie.
+
+    Sur un appel SORTANT le caller ID ne vaut rien : c'est le numero que NOUS
+    avons compose, il ne dit pas qui a decroche. Le palier 1 y est donc
+    inaccessible et seul le mot de passe ouvre quelque chose — ce qui permet
+    quand meme a Raphael, quand c'est lui qui decroche, d'atteindre ses donnees
+    en se verifiant (constat de son appel de test du 29/08 : « l'appel aux
+    outils, ce n'est pas ca encore »).
+    """
+    if est_sortant():
+        return 2 if mdp_verifie() else 0
     if not is_raphael():
         return 0
     return 2 if mdp_verifie() else 1
