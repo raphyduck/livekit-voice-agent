@@ -2,6 +2,7 @@ import asyncio
 import json
 import re
 import logging
+import time
 import os
 
 import httpx
@@ -104,6 +105,29 @@ def _make_llm(model: str):
     if model.startswith(_CLAUDE5_PREFIXES):
         return _Claude5LLM(model=model, caching="ephemeral")
     return anthropic.LLM(model=model, temperature=0.7, caching="ephemeral")
+
+
+MODELES = {
+    "haiku": "claude-haiku-4-5",
+    "sonnet": "claude-sonnet-5",
+    "opus": "claude-opus-5",
+    "terra": "gpt-5.6-terra",
+    "luna": "gpt-5.6-luna",
+}
+# Defaut valide par Raphael en appel reel le 29/08/2026, dans les DEUX sens.
+# Mesure decisive : le TTFT doit se comparer AVEC les outils, puisque l'agent
+# en a toujours. haiku-4-5 ne paie aucun surcout d'outillage (0,64 s avec
+# 9 outils, contre 1,29 s pour terra qui en paie 0,69). En appel reel :
+# TTFT median 1,09 s sur 16 tours.
+MODELE_DEFAUT = "haiku"
+
+
+def _resoudre_modele(demande: str | None = None) -> str:
+    """Nom d'API du modele pour cet appel. `demande` vient du metadata (sortant)."""
+    m = demande or os.environ.get("LLM_MODEL") or os.environ.get("VOICE_LLM", MODELE_DEFAUT)
+    return MODELES.get(
+        m, m if (m.startswith("claude") or m.startswith("gpt")) else MODELES[MODELE_DEFAUT]
+    )
 
 
 # Délai de silence (secondes) avant relance puis raccrochage.
@@ -316,26 +340,7 @@ async def entrypoint(ctx: agents.JobContext):
 
     # Modele par appel : entrant => Sonnet (qualite, besoin imprevisible) ;
     # sortant => choix passe dans le metadata (defaut Haiku, sinon LLM_MODEL).
-    _MODEL_MAP = {
-        "haiku": "claude-haiku-4-5",
-        "sonnet": "claude-sonnet-5",
-        "opus": "claude-opus-5",
-        "terra": "gpt-5.6-terra",
-        "luna": "gpt-5.6-luna",
-    }
-    # Defaut valide par Raphael en appel reel le 29/08/2026, dans les DEUX
-    # sens. Mesure decisive : le TTFT doit se comparer AVEC les outils, puisque
-    # l'agent en a toujours. haiku-4-5 ne paie aucun surcout d'outillage
-    # (0,64 s avec 9 outils, contre 1,29 s pour terra qui en paie 0,69).
-    # En appel reel : TTFT median 1,09 s sur 16 tours.
-    _DEFAUT = os.environ.get("VOICE_LLM", "haiku")
-    if is_outbound:
-        _m = call_ctx.get("model") or os.environ.get("LLM_MODEL") or _DEFAUT
-    else:
-        _m = _DEFAUT
-    llm_model = _MODEL_MAP.get(
-        _m, _m if (_m.startswith("claude") or _m.startswith("gpt")) else "claude-haiku-4-5"
-    )
+    llm_model = _resoudre_modele(call_ctx.get("model") if is_outbound else None)
     logger.info("LLM pour cet appel: %s (outbound=%s)", llm_model, is_outbound)
 
     # --- Compte-rendu garanti : callback shutdown enregistre AU PLUS TOT ------
@@ -951,6 +956,51 @@ CONTEXTE DE CET APPEL (SORTANT) :
             asyncio.create_task(_test_press())
 
 
+def prechauffer(proc: agents.JobProcess) -> None:
+    """Ouvre la voie vers le LLM avant le premier appel, dans chaque process.
+
+    Sans cela, la toute premiere requete d'un process fraichement demarre paie
+    en une fois la connexion TLS vers le fournisseur ET la creation du cache de
+    prompt : 4,4 s mesurees le 29/08/2026, contre 1,1 s ensuite. Sous la charge
+    d'un vrai appel (STT, TTS et annulation de bruit en parallele), cela a
+    depasse le timeout de 10 s de la session : deux « Request timed out » de
+    suite, et un agent MUET pendant que Raphael repetait « allo ».
+
+    Le prechauffage est volontairement discret : borne dans le temps, et une
+    panne ici ne doit jamais empecher le worker de demarrer — un agent qui
+    repond lentement au premier tour vaut mieux qu'un agent qui ne demarre pas.
+    """
+    if os.environ.get("PRECHAUFFAGE", "1").strip() in ("0", "false", "False"):
+        logger.info("Prechauffage desactive (PRECHAUFFAGE=0)")
+        return
+
+    async def _chauffe() -> float | None:
+        from livekit.agents import ChatContext
+
+        llm = _make_llm(_resoudre_modele())
+        ctx = ChatContext()
+        ctx.add_message(role="system", content=get_system_prompt())
+        ctx.add_message(role="user", content="Bonjour")
+        debut = time.monotonic()
+        async with llm.chat(chat_ctx=ctx, tools=TOOLS_RESTREINT) as flux:
+            async for bout in flux:
+                delta = getattr(bout, "delta", None)
+                if delta and delta.content:
+                    return time.monotonic() - debut
+        return None
+
+    try:
+        duree = asyncio.run(asyncio.wait_for(_chauffe(), timeout=20))
+        logger.info("Prechauffage LLM (%s) : premier mot en %.2f s",
+                    _resoudre_modele(), duree or -1)
+    except asyncio.TimeoutError:
+        logger.warning("Prechauffage LLM abandonne (plus de 20 s), on demarre quand meme")
+    except Exception:  # noqa: BLE001
+        logger.warning("Prechauffage LLM impossible, on demarre quand meme", exc_info=True)
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG)
-    agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint))
+    agents.cli.run_app(
+        agents.WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prechauffer)
+    )
