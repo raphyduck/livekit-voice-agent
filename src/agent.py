@@ -14,7 +14,9 @@ from livekit.agents import (
     TurnHandlingOptions, inference, mcp, metrics,
 )
 from livekit.agents.voice.turn import InterruptionOptions, PreemptiveGenerationOptions
-from livekit.plugins import anthropic, cartesia, deepgram, noise_cancellation, silero
+from livekit.plugins import (
+    anthropic, cartesia, deepgram, noise_cancellation, openai, silero,
+)
 from livekit.agents.voice.amd import AMD
 
 from .system_prompt import get_system_prompt
@@ -85,6 +87,19 @@ class _Claude5LLM(anthropic.LLM):
 
 
 def _make_llm(model: str):
+    """Construit le LLM de l'appel, chez Anthropic ou via la passerelle LiteLLM.
+
+    Tout modele qui n'est pas un « claude-* » part sur LiteLLM (127.0.0.1:4000),
+    la meme passerelle que LibreChat : cela ouvre les 18 modeles du serveur sans
+    ecrire un client par fournisseur.
+    """
+    if not model.startswith("claude"):
+        base = os.environ.get("LITELLM_URL", "http://127.0.0.1:4000/v1")
+        cle = os.environ.get("LITELLM_KEY", "")
+        if not cle:
+            logger.error("LITELLM_KEY absente, repli sur claude-sonnet-5")
+            return _Claude5LLM(model="claude-sonnet-5", caching="ephemeral")
+        return openai.LLM(model=model, base_url=base, api_key=cle, temperature=0.6)
     if model.startswith(_CLAUDE5_PREFIXES):
         return _Claude5LLM(model=model, caching="ephemeral")
     return anthropic.LLM(model=model, temperature=0.7, caching="ephemeral")
@@ -258,13 +273,19 @@ async def entrypoint(ctx: agents.JobContext):
 
     # Modele par appel : entrant => Sonnet (qualite, besoin imprevisible) ;
     # sortant => choix passe dans le metadata (defaut Haiku, sinon LLM_MODEL).
-    _MODEL_MAP = {"haiku": "claude-haiku-4-5", "sonnet": "claude-sonnet-5"}
-    _DEFAUT = os.environ.get("VOICE_LLM", "sonnet")
+    _MODEL_MAP = {
+        "haiku": "claude-haiku-4-5",
+        "sonnet": "claude-sonnet-5",
+        "opus": "claude-opus-5",
+        "terra": "gpt-5.6-terra",
+        "luna": "gpt-5.6-luna",
+    }
+    _DEFAUT = os.environ.get("VOICE_LLM", "terra")
     if is_outbound:
         _m = call_ctx.get("model") or os.environ.get("LLM_MODEL") or _DEFAUT
     else:
         _m = _DEFAUT
-    llm_model = _MODEL_MAP.get(_m, _m if _m.startswith("claude") else "claude-sonnet-5")
+    llm_model = _MODEL_MAP.get(_m, _m if (_m.startswith("claude") or _m.startswith("gpt")) else "gpt-5.6-terra")
     logger.info("LLM pour cet appel: %s (outbound=%s)", llm_model, is_outbound)
 
     # --- Compte-rendu garanti : callback shutdown enregistre AU PLUS TOT ------

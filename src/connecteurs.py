@@ -41,62 +41,64 @@ logger = logging.getLogger("voice-agent.connecteurs")
 
 TIMEOUT = 20.0
 
-# --- Registre : nom -> (palier requis, resume, outils autorises) ------------
+# --- Registre : nom -> (palier requis, resume) -----------------------------
 # Les resumes sont ce que le LLM lit dans lister_connecteurs : courts, en
-# francais, orientes usage telephonique.
+# francais, orientes usage telephonique. Les outils ne sont PAS listes ici :
+# a ~260 outils sur 16 serveurs, une liste blanche nominative serait fausse
+# des la prochaine mise a jour d'un connecteur. La regle est structurelle et
+# vaut pour tous : lecture autorisee, ecriture refusee (voir _LECTURE /
+# _ECRITURE plus bas), avec le meme resultat — un outil ajoute en amont est
+# refuse par defaut tant qu'il ne ressemble pas a une lecture.
 REGISTRE: dict[str, dict] = {
-    "calibre": {
-        "palier": 1,
-        "resume": "Bibliotheque de livres : recherche, metadonnees, parutions.",
-        "outils": ["chercher", "lister_series", "parutions_serie", "manques",
-                   "stock_par_serie"],
-    },
-    "photos": {
-        "palier": 1,
-        "resume": "Bibliotheque photo (PhotoPrism) : recherche par personne, lieu, date.",
-        "outils": ["chercher", "photo", "apercu", "albums", "etiquettes",
-                   "personnes", "statistiques"],
-    },
-    "beeper": {
-        "palier": 1,
-        "resume": "Messageries (WhatsApp, SMS, Signal...) : lire les conversations recentes.",
-        "outils": ["search_chats", "list_messages", "get_chat", "search_messages",
-                   "search", "get_accounts"],
-    },
-    "qonto": {
-        "palier": 2,
-        "resume": "Comptes bancaires professionnels : soldes, transactions, factures.",
-        "outils": ["qonto_consolidated_balances", "qonto_list_transactions",
-                   "qonto_get_transaction", "qonto_list_organizations",
-                   "qonto_list_supplier_invoices", "qonto_list_client_invoices",
-                   "qonto_list_statements"],
-    },
-    "crypto": {
-        "palier": 2,
-        "resume": "Portefeuille crypto : valorisation, soldes, positions. Lecture seule.",
-        "outils": ["get_portfolio", "get_balances", "get_crypto_prices",
-                   "get_eth_tokens", "get_bch_balances", "get_defi_positions",
-                   "get_history", "list_wallets", "safe_info"],
-    },
-    "digifinex": {
-        "palier": 2,
-        "resume": "Compte d'echange DigiFinex : soldes spot, ordres, historique.",
-        "outils": ["digifinex_spot_assets", "digifinex_ticker",
-                   "digifinex_my_trades", "digifinex_open_orders",
-                   "digifinex_order_history", "digifinex_financelog"],
-    },
-    "fichiers": {
-        "palier": 2,
-        "resume": "Fichiers du serveur : lister, lire un document. Lecture seule.",
-        "outils": ["list_roots", "list_dir", "stat", "read_text", "read_document"],
-    },
+    # --- Palier 1 : caller ID de Raphael. Rien de sensible ici. -------------
+    "calibre": {"palier": 1, "resume": "Bibliotheque de livres : series, recherche, parutions, manques."},
+    "photos": {"palier": 1, "resume": "Bibliotheque photo : recherche, personnes, albums, statistiques."},
+    "beeper": {"palier": 1, "resume": "Messageries (WhatsApp, SMS, Signal...) : lire conversations et messages."},
+    "gcal": {"palier": 1, "resume": "Agenda Google : calendriers, evenements, disponibilites."},
+    "sched": {"palier": 1, "resume": "Taches planifiees du serveur : lister ce qui tourne."},
+    # --- Palier 2 : mot de passe vocal. Argent, documents, correspondance. --
+    "qonto": {"palier": 2, "resume": "Banque Qonto : soldes, transactions, factures, releves."},
+    "amina": {"palier": 2, "resume": "Banque AMINA (crypto, Zug) : comptes, soldes, transactions."},
+    "crypto": {"palier": 2, "resume": "Portefeuille crypto : valorisation, soldes, positions DeFi, historique."},
+    "digifinex": {"palier": 2, "resume": "Echange DigiFinex : soldes spot, ordres, trades, historique."},
+    "pennylane": {"palier": 2, "resume": "Comptabilite Pennylane : factures, ecritures, comptes, clients."},
+    "fichiers": {"palier": 2, "resume": "Fichiers du serveur : lister, lire un document."},
+    "rclone": {"palier": 2, "resume": "Stockages distants (Drive, S3...) : lister, lire, chercher."},
+    "imap2": {"palier": 2, "resume": "Emails : chercher, lire, fils de discussion, etat des boites."},
+    "notion": {"palier": 2, "resume": "Notion : rechercher et lire pages et bases."},
+    "wp": {"palier": 2, "resume": "Sites WordPress : articles, pages, medias, commentaires (lecture)."},
+    "twilio2": {"palier": 2, "resume": "Telephonie Twilio : historique des appels et des SMS recus."},
 }
 
-# Ce que la passerelle refuse toujours de relayer, meme si un jour la liste
-# blanche d'un connecteur s'elargit par erreur. Ceinture et bretelles.
-MOTIFS_INTERDITS = ("delete", "supprim", "send", "envoy", "write", "ecrire", "push",
-                    "upload", "transfer", "virement", "withdraw", "broadcast",
-                    "propose", "sign", "bash", "shell", "exec")
+# --- Lecture seule : deux filtres qui doivent tomber d'accord ---------------
+# 1. l'outil doit RESSEMBLER a une lecture (_LECTURE), sinon il est refuse ;
+# 2. il ne doit contenir AUCUN motif d'ecriture (_ECRITURE), meme s'il a passe
+#    le premier filtre — « imap_bulk_delete_by_search » contient « search ».
+# Refus par defaut : ce qui n'est pas reconnu comme une lecture ne passe pas.
+_LECTURE = (
+    "get", "list", "lister", "read", "lire", "search", "cherch", "recherch",
+    "find", "trouv", "query", "fetch", "retrieve", "stat", "info", "whoami",
+    "self", "balance", "portfolio", "ticker", "history", "historique",
+    "consolidated", "apercu", "photo", "albums", "etiquettes", "personnes",
+    "parutions", "manques", "series", "freebusy", "current-time", "status",
+    "pending", "colors", "assets", "trades", "orders", "log", "chat",
+    "messages", "accounts", "abilities", "site", "theme", "backups",
+    "export", "decode", "download", "pull", "stock", "transcri", "unread",
+    "posts", "pages", "media", "comments", "labels", "memberships",
+)
+_ECRITURE = (
+    "delete", "suppr", "remove", "retir", "del_", "purge", "clear",
+    "send", "envoy", "reply", "repond", "respond", "forward", "post-page",
+    "post_page", "create_post", "create-post",
+    "creer", "cree", "create", "add", "ajout", "insert", "new_",
+    "update", "patch", "put", "modif", "edit", "set_", "definir", "rename",
+    "move", "deplac", "archive", "restore", "save", "draft", "upload",
+    "push", "write", "ecrire", "televerser", "integrer", "indexer",
+    "marqu", "mark", "approve", "whitelist", "build", "sign", "broadcast",
+    "propose", "discard", "revoke", "transfer", "virement", "withdraw",
+    "exec", "run", "bash", "shell", "manage", "moderate", "connect",
+    "disconnect", "hangup", "speak", "dtmf", "make_call", "focus", "reminder",
+)
 
 
 def _env(nom: str, suffixe: str) -> str:
@@ -113,24 +115,22 @@ def connecteurs_disponibles(palier: int) -> dict[str, dict]:
 
 
 def outil_autorise(nom_connecteur: str, outil: str) -> tuple[bool, str]:
-    cfg = REGISTRE.get(nom_connecteur)
-    if not cfg:
+    """Un outil passe s'il ressemble a une lecture et a rien qui ecrive."""
+    if nom_connecteur not in REGISTRE:
         return False, f"connecteur inconnu : {nom_connecteur}"
     bas = outil.lower()
-    for motif in MOTIFS_INTERDITS:
+    for motif in _ECRITURE:
         if motif in bas:
             return False, (
-                f"l'outil « {outil} » ressemble a une action d'ecriture ou de "
-                "suppression : refuse par telephone"
+                f"« {outil} » modifie, envoie ou supprime quelque chose : "
+                "refuse par telephone, quel que soit l'appelant"
             )
-    # Le nom peut arriver prefixe par le serveur (ex. qonto_qonto_list_...).
-    court = outil.split("_", 1)[1] if outil.startswith(nom_connecteur + "_") else outil
-    if court not in cfg["outils"] and outil not in cfg["outils"]:
+    if not any(motif in bas for motif in _LECTURE):
         return False, (
-            f"outil « {outil} » hors de la liste autorisee pour {nom_connecteur}. "
-            f"Autorises : {', '.join(cfg['outils'])}"
+            f"« {outil} » n'est pas reconnu comme une lecture ; par prudence il "
+            "est refuse. Utilise lister_outils pour voir ce qui est disponible."
         )
-    return True, court
+    return True, outil
 
 
 async def _session_mcp(client: httpx.AsyncClient, url: str, headers: dict) -> dict:

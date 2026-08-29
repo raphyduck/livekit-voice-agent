@@ -695,13 +695,12 @@ async def lister_outils(connecteur: str) -> str:
     except Exception as e:  # noqa: BLE001
         logger.exception("lister_outils %s", connecteur)
         return f"Connecteur {connecteur} injoignable : {e}"
-    autorises = _cx.REGISTRE[connecteur]["outils"]
     lignes = []
     for o in distants:
         nom = o.get("name", "")
-        court = nom.split("_", 1)[1] if nom.startswith(connecteur + "_") else nom
-        if court not in autorises and nom not in autorises:
-            continue
+        ok, _ = _cx.outil_autorise(connecteur, nom)
+        if not ok:
+            continue  # ecriture ou outil non reconnu comme lecture : invisible
         params = ", ".join((o.get("inputSchema") or {}).get("properties", {}).keys())
         lignes.append(f"- {nom}({params}) : {(o.get('description') or '')[:150]}")
     if not lignes:
