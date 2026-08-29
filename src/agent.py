@@ -504,6 +504,13 @@ CONTEXTE DE CET APPEL (SORTANT) :
     # fois, puis au silence suivant on raccroche poliment.
     inactivity_task: asyncio.Task | None = None
     relance_count = 0
+    # Outils en cours d'execution. Le minuteur de silence ne doit pas tourner
+    # pendant qu'un outil travaille : c'est l'agent qui fait patienter, pas
+    # l'interlocuteur qui s'absente (constat de Raphael, 29/08/2026 : l'agent
+    # disait « un instant, je regarde » puis, quelques secondes plus tard,
+    # « vous etes toujours la ? »).
+    outils_en_cours = 0
+    etat_agent = "initializing"
 
     # --- Mesure de latence : loguer les métriques de chaque tour ----------
     @session.on("metrics_collected")
@@ -531,7 +538,11 @@ CONTEXTE DE CET APPEL (SORTANT) :
             await asyncio.sleep(INACTIVITY_TIMEOUT)
         except asyncio.CancelledError:
             return
-        # Ne relancer que si l'agent ne parle pas déjà (sécurité).
+        # Un outil a pu demarrer pendant l'attente : dernier controle avant de
+        # parler, sinon on relance en plein milieu d'une recherche.
+        if _agent_occupe():
+            _arm_inactivity()
+            return
         relance_count += 1
         if relance_count == 1:
             await session.say("Vous êtes toujours là ?", allow_interruptions=True)
@@ -544,8 +555,24 @@ CONTEXTE DE CET APPEL (SORTANT) :
             )
             await _hangup()
 
+    def _agent_occupe() -> bool:
+        """L'agent travaille-t-il ? Alors le silence d'en face est normal.
+
+        Deux raisons de ne pas compter : un outil tourne, ou l'agent parle /
+        reflechit. Le cas de l'outil ne se deduit PAS de l'etat : livekit met
+        l'agent en « listening » pendant un appel d'outil quand il n'a pas de
+        parole de fond (agent_activity.py : `"thinking" if
+        self._background_speeches else "listening"`), ce qui armait le minuteur
+        au milieu d'une recherche. D'ou le comptage explicite des outils.
+        """
+        return outils_en_cours > 0 or etat_agent in ("speaking", "thinking", "initializing")
+
     def _arm_inactivity() -> None:
         nonlocal inactivity_task
+        if _agent_occupe():
+            # On reviendra armer quand l'agent aura fini (agent_state_changed
+            # « listening » ou fin du dernier outil).
+            return
         current = asyncio.current_task()
         if inactivity_task and inactivity_task is not current and not inactivity_task.done():
             inactivity_task.cancel()
@@ -574,7 +601,9 @@ CONTEXTE DE CET APPEL (SORTANT) :
 
     @session.on("agent_state_changed")
     def _on_agent_state(ev):
+        nonlocal etat_agent
         new = getattr(ev, "new_state", None)
+        etat_agent = new or etat_agent
         if new == "speaking":
             # L'agent parle : ce n'est pas un silence, on suspend le décompte.
             if inactivity_task and not inactivity_task.done():
@@ -584,6 +613,24 @@ CONTEXTE DE CET APPEL (SORTANT) :
             # (couvre le cas où l'utilisateur était déjà silencieux, donc aucun
             #  user_state_changed ne se déclenche après la réponse de l'agent)
             _arm_inactivity()
+
+    # --- Outils en cours : suspendre le minuteur de silence pendant le travail -
+    @session.on("tool_execution_updated")
+    def _on_tool_execution(ev):
+        nonlocal outils_en_cours
+        try:
+            type_maj = getattr(getattr(ev, "update", None), "type", "")
+            if type_maj == "tool_call_started":
+                outils_en_cours += 1
+                _cancel_inactivity()
+            elif type_maj == "tool_call_ended":
+                outils_en_cours = max(0, outils_en_cours - 1)
+                if outils_en_cours == 0:
+                    # L'outil a rendu : l'agent va parler, le minuteur repartira
+                    # quand il repassera en ecoute.
+                    _arm_inactivity()
+        except Exception:
+            logger.exception("suivi des outils en cours")
 
     # --- Mode OTP : suivre l'instruction vocale et presser la touche demandee ---
     # Certains services (WhatsApp) demandent "press N" / "appuyez sur N" avant de

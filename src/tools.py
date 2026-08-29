@@ -621,8 +621,23 @@ def _comparer_mot_de_passe(dit: str, attendu: str) -> str | None:
     if a == b:
         return "exact"
     ma, mb = a.split(), b.split()
+    # On parle, on ne tape pas : le mot de passe arrive enrobe dans une phrase
+    # (« c'est fleur de lys », « alors, fleur de lys, voila »). Exiger le meme
+    # nombre de mots rejetait Raphael disant pourtant le bon secret le
+    # 29/08/2026. On cherche donc le secret parmi les fenetres de meme longueur
+    # de ce qui a ete dit, et on garde la meilleure.
     if len(ma) != len(mb):
-        return None
+        if len(ma) < len(mb) or len(ma) > len(mb) + 12:
+            return None  # trop court pour contenir le secret, ou tirade suspecte
+        meilleur = None
+        for i in range(len(ma) - len(mb) + 1):
+            fenetre = " ".join(ma[i:i + len(mb)])
+            trouve = _comparer_mot_de_passe(fenetre, b)
+            if trouve == "exact":
+                return "dit dans une phrase"
+            if trouve and meilleur is None:
+                meilleur = "dit dans une phrase, transcription approximative"
+        return meilleur
     differents = [(x, y) for x, y in zip(ma, mb) if x != y]
     if len(differents) > 1:
         return None
