@@ -562,6 +562,10 @@ CONTEXTE DE CET APPEL (SORTANT) :
     # est dans le prompt ; ici on evite au moins de le relancer alors qu'il
     # croit legitimement qu'on travaille pour lui.
     attente_promise = False
+    # Le raccrochage est un point de non-retour : une fois engage, plus aucune
+    # relance, plus aucun minuteur. Sans ce verrou, l'agent a repete « je vais
+    # raccrocher » TREIZE fois en trois minutes sur un repondeur, le 29/08/2026.
+    raccrochage_engage = False
 
     # --- Mesure de latence : loguer les métriques de chaque tour ----------
     @session.on("metrics_collected")
@@ -572,16 +576,36 @@ CONTEXTE DE CET APPEL (SORTANT) :
             logger.debug("metrics: %s", getattr(ev, "metrics", None))
 
     async def _hangup() -> None:
+        """Coupe la ligne. Appelable plusieurs fois, ne raccroche qu'une.
+
+        Deux pieges, tous deux constates le 29/08/2026 sur un appel tombe sur
+        un repondeur :
+        - `wait_for_idle()` sans borne ne rend JAMAIS la main si l'agent se
+          remet a parler entre-temps ; le raccrochage restait suspendu pendant
+          que le minuteur relancait, et l'agent a repete « je vais raccrocher »
+          treize fois en trois minutes, jusqu'a saturer la messagerie.
+        - supprimer la room peut echouer ; il faut alors une seconde voie de
+          sortie, sinon l'appel ne se termine pas du tout.
+        """
+        nonlocal raccrochage_engage
+        if raccrochage_engage:
+            return
+        raccrochage_engage = True
+        _cancel_inactivity()
         try:
-            # Attendre la fin de la parole en cours avant de couper la ligne.
+            # Laisser finir la phrase en cours, mais jamais plus de 6 secondes.
             try:
-                await session.wait_for_idle()
-            except Exception:  # noqa: BLE001
-                await asyncio.sleep(2.0)
+                await asyncio.wait_for(session.wait_for_idle(), timeout=6.0)
+            except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+                pass
             await asyncio.sleep(0.3)  # marge réseau dernier paquet audio
             await ctx.api.room.delete_room(api.DeleteRoomRequest(room=ctx.room.name))
         except Exception:  # noqa: BLE001
-            logger.exception("Échec du raccrochage automatique")
+            logger.exception("Échec de la suppression de room, arrêt du job à la place")
+            try:
+                ctx.shutdown(reason="raccrochage")
+            except Exception:  # noqa: BLE001
+                logger.exception("Échec de l'arrêt du job")
 
     async def _inactivity_watch() -> None:
         nonlocal relance_count
@@ -596,16 +620,25 @@ CONTEXTE DE CET APPEL (SORTANT) :
         if _agent_occupe():
             _arm_inactivity()
             return
+        if raccrochage_engage:
+            return
         relance_count += 1
         if relance_count == 1:
             await session.say("Vous êtes toujours là ?", allow_interruptions=True)
             # Réarmer pour laisser une 2e chance APRÈS la relance.
             _arm_inactivity()
         else:
-            await session.say(
-                "Je vais raccrocher, n'hésitez pas à me rappeler. Au revoir.",
-                allow_interruptions=False,
-            )
+            # Le minuteur est coupe AVANT de parler ; pendant la phrase d'adieu
+            # l'agent est en « speaking », donc _agent_occupe() empeche tout
+            # rearmement, et _hangup pose ensuite le verrou definitif.
+            _cancel_inactivity()
+            try:
+                await session.say(
+                    "Je vais raccrocher, n'hésitez pas à me rappeler. Au revoir.",
+                    allow_interruptions=False,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("Adieu non prononcé, on raccroche quand même")
             await _hangup()
 
     def _agent_occupe() -> bool:
@@ -618,7 +651,11 @@ CONTEXTE DE CET APPEL (SORTANT) :
         self._background_speeches else "listening"`), ce qui armait le minuteur
         au milieu d'une recherche. D'ou le comptage explicite des outils.
         """
-        return outils_en_cours > 0 or etat_agent in ("speaking", "thinking", "initializing")
+        return (
+            raccrochage_engage
+            or outils_en_cours > 0
+            or etat_agent in ("speaking", "thinking", "initializing")
+        )
 
     def _arm_inactivity() -> None:
         nonlocal inactivity_task
