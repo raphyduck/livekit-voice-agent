@@ -620,6 +620,13 @@ def _comparer_mot_de_passe(dit: str, attendu: str) -> str | None:
         return None
     if a == b:
         return "exact"
+    # Le decoupage en mots est lui-meme une decision du STT : « lune » peut
+    # arriver « l une », « aujourd'hui » en « au jour d'hui ». On compare donc
+    # aussi les formes collees, reduites phonetiquement — egalite stricte
+    # exigee ici, sans quoi « fleurdelys » et « fleurdelune » se ressembleraient
+    # trop une fois les espaces retires.
+    if _reduire_phonetique(a.replace(" ", "")) == _reduire_phonetique(b.replace(" ", "")):
+        return "decoupage des mots approximatif"
     ma, mb = a.split(), b.split()
     # On parle, on ne tape pas : le mot de passe arrive enrobe dans une phrase
     # (« c'est fleur de lys », « alors, fleur de lys, voila »). Exiger le meme

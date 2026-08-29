@@ -108,6 +108,17 @@ def _make_llm(model: str):
 
 # Délai de silence (secondes) avant relance puis raccrochage.
 INACTIVITY_TIMEOUT = 10.0
+# Quand l'agent vient de dire « un instant, je regarde », le silence qui suit
+# est celui de quelqu'un qui attend une reponse promise : on lui laisse le
+# temps avant de demander s'il est toujours la.
+INACTIVITY_PROMESSE = 30.0
+# Formules par lesquelles l'agent annonce qu'il cherche quelque chose.
+_MOTIFS_ATTENTE = re.compile(
+    r"\b(un instant|une seconde|deux secondes|je regarde|je vérifie|je verifie|"
+    r"je consulte|je cherche|je vais voir|laisse-moi voir|je te vérifie|"
+    r"je vous vérifie|je m'en occupe|patiente|patientez)\b",
+    re.IGNORECASE,
+)
 
 # Jeu COMPLET : appel entrant de Raphael identifie. Il peut tout demander.
 TOOLS = [
@@ -153,26 +164,50 @@ TOOLS_RESTREINT = [
 ]
 
 
-async def _probe_mcp(url: str, headers: dict | None = None, timeout: float = 4.0) -> bool:
-    """Vérifie qu'un serveur MCP répond avant de l'attacher à l'agent.
+async def _probe_mcp(url: str, headers: dict | None = None, timeout: float = 6.0) -> bool:
+    """Verifie qu'un serveur MCP tient un vrai handshake avant de l'attacher.
 
-    Un serveur injoignable (DNS, refus de connexion, 4xx/5xx) ne doit JAMAIS
-    faire planter toolset.setup(), ce qui rendrait l'agent muet après le
-    message d'accueil. On ne garde le serveur que s'il répond avec un statut
-    < 400.
+    Un serveur MCP casse l'agent des l'initialisation de la session : le setup
+    du toolset leve, l'appel demarre a moitie et l'interlocuteur tombe sur un
+    agent inutilisable. Le filet doit donc etre pose AVANT l'attachement.
+
+    L'ancienne sonde faisait un GET et acceptait tout statut < 400. Insuffisant,
+    constate le 29/08/2026 : le serveur WhatsApp repond 200 au GET mais rend un
+    Content-Type VIDE sur le POST initialize, et le client MCP refuse
+    (« Expected response header Content-Type to contain 'text/event-stream' »).
+    L'agent partait donc en erreur sur chaque appel entrant. On rejoue ici le
+    vrai premier echange : POST initialize, et le type de contenu doit etre
+    exploitable.
     """
-    probe_headers = {"Accept": "text/event-stream"}
+    probe_headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
     if headers:
         probe_headers.update(headers)
+    corps = {
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "voice-agent-probe", "version": "1.0"},
+        },
+    }
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            async with client.stream("GET", url, headers=probe_headers) as resp:
-                ok = resp.status_code < 400
-                if not ok:
-                    logger.warning("MCP %s répond %s, ignoré", url, resp.status_code)
-                return ok
+            resp = await client.post(url, headers=probe_headers, json=corps)
+        if resp.status_code >= 400:
+            logger.warning("MCP %s repond %s, ignore", url, resp.status_code)
+            return False
+        type_contenu = (resp.headers.get("content-type") or "").lower()
+        if not ("json" in type_contenu or "event-stream" in type_contenu):
+            logger.warning(
+                "MCP %s : Content-Type inexploitable (%r), ignore pour ne pas "
+                "casser la session", url, type_contenu)
+            return False
+        return True
     except Exception as exc:  # noqa: BLE001
-        logger.warning("MCP %s injoignable (%s), ignoré", url, exc)
+        logger.warning("MCP %s injoignable (%s), ignore", url, exc)
         return False
 
 
@@ -462,6 +497,10 @@ CONTEXTE DE CET APPEL (SORTANT) :
     # on l'utilise comme source de vérité principale pour le transcript.
     live_transcript: list[str] = []
 
+    def _set_attente_promise(valeur: bool) -> None:
+        nonlocal attente_promise
+        attente_promise = valeur
+
     @session.on("conversation_item_added")
     def _on_conv_item(ev):
         try:
@@ -474,6 +513,11 @@ CONTEXTE DE CET APPEL (SORTANT) :
                 return
             qui = "Agent" if role == "assistant" else "Interlocuteur"
             live_transcript.append(f"{qui}: {txt}")
+            nonlocal_attente = _MOTIFS_ATTENTE.search(txt or "") is not None
+            if role == "assistant":
+                _set_attente_promise(nonlocal_attente)
+            elif role == "user":
+                _set_attente_promise(False)
         except Exception:
             logger.exception("Erreur capture live transcript (conversation_item_added)")
 
@@ -511,6 +555,13 @@ CONTEXTE DE CET APPEL (SORTANT) :
     # « vous etes toujours la ? »).
     outils_en_cours = 0
     etat_agent = "initializing"
+    # L'agent vient-il de promettre un resultat (« un instant, je regarde ») ?
+    # Filet pour le cas ou le modele annonce l'attente SANS lancer l'outil dans
+    # le meme tour : mesure du 29/08, 20 s se sont ecoulees entre l'annonce et
+    # la plainte de Raphael, sans le moindre appel d'outil. La vraie correction
+    # est dans le prompt ; ici on evite au moins de le relancer alors qu'il
+    # croit legitimement qu'on travaille pour lui.
+    attente_promise = False
 
     # --- Mesure de latence : loguer les métriques de chaque tour ----------
     @session.on("metrics_collected")
@@ -535,7 +586,9 @@ CONTEXTE DE CET APPEL (SORTANT) :
     async def _inactivity_watch() -> None:
         nonlocal relance_count
         try:
-            await asyncio.sleep(INACTIVITY_TIMEOUT)
+            await asyncio.sleep(
+                INACTIVITY_PROMESSE if attente_promise else INACTIVITY_TIMEOUT
+            )
         except asyncio.CancelledError:
             return
         # Un outil a pu demarrer pendant l'attente : dernier controle avant de
