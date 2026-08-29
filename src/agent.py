@@ -323,12 +323,19 @@ async def entrypoint(ctx: agents.JobContext):
         "terra": "gpt-5.6-terra",
         "luna": "gpt-5.6-luna",
     }
-    _DEFAUT = os.environ.get("VOICE_LLM", "terra")
+    # Defaut valide par Raphael en appel reel le 29/08/2026, dans les DEUX
+    # sens. Mesure decisive : le TTFT doit se comparer AVEC les outils, puisque
+    # l'agent en a toujours. haiku-4-5 ne paie aucun surcout d'outillage
+    # (0,64 s avec 9 outils, contre 1,29 s pour terra qui en paie 0,69).
+    # En appel reel : TTFT median 1,09 s sur 16 tours.
+    _DEFAUT = os.environ.get("VOICE_LLM", "haiku")
     if is_outbound:
         _m = call_ctx.get("model") or os.environ.get("LLM_MODEL") or _DEFAUT
     else:
         _m = _DEFAUT
-    llm_model = _MODEL_MAP.get(_m, _m if (_m.startswith("claude") or _m.startswith("gpt")) else "gpt-5.6-terra")
+    llm_model = _MODEL_MAP.get(
+        _m, _m if (_m.startswith("claude") or _m.startswith("gpt")) else "claude-haiku-4-5"
+    )
     logger.info("LLM pour cet appel: %s (outbound=%s)", llm_model, is_outbound)
 
     # --- Compte-rendu garanti : callback shutdown enregistre AU PLUS TOT ------
