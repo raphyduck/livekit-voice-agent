@@ -14,7 +14,8 @@ from livekit.agents import (
     TurnHandlingOptions, inference, mcp, metrics,
 )
 from livekit.agents.voice.turn import InterruptionOptions, PreemptiveGenerationOptions
-from livekit.plugins import anthropic, cartesia, deepgram, silero
+from livekit.plugins import anthropic, cartesia, deepgram, noise_cancellation, silero
+from livekit.agents.voice.amd import AMD
 
 from .system_prompt import get_system_prompt
 from .tools import (
@@ -54,13 +55,37 @@ logger = logging.getLogger("voice-agent")
 # les Claude 4.x récents qui se comportent comme 4.6 côté prefill.
 try:
     import livekit.plugins.anthropic.llm as _anthropic_llm
-    _extra_no_prefill = ("claude-haiku-4-5",)
+    _extra_no_prefill = (
+        "claude-haiku-4-5",
+        "claude-sonnet-5", "claude-opus-5", "claude-fable-5", "claude-mythos",
+    )
     _existing = tuple(_anthropic_llm._NO_PREFILL_PATTERNS)
     _merged = _existing + tuple(p for p in _extra_no_prefill if p not in _existing)
     _anthropic_llm._NO_PREFILL_PATTERNS = _merged
     logger.info("Patch prefill appliqué, modèles no-prefill: %s", _merged)
 except Exception:  # noqa: BLE001
     logger.exception("Échec du patch _NO_PREFILL_PATTERNS")
+
+# --- Claude 5 : contraintes API (constat 29/08/2026) -----------------------
+# - `temperature` non-defaut => 400 "deprecated for this model".
+# - thinking adaptatif ACTIF par defaut => latence imprevisible au telephone,
+#   on le desactive explicitement a chaque requete via extra_kwargs.
+# - prefill (message assistant final) refuse => couvert par le patch ci-dessus.
+_CLAUDE5_PREFIXES = ("claude-sonnet-5", "claude-opus-5", "claude-fable-5", "claude-mythos")
+
+
+class _Claude5LLM(anthropic.LLM):
+    def chat(self, **kwargs):
+        extra = dict(kwargs.pop("extra_kwargs", None) or {})
+        extra.setdefault("thinking", {"type": "disabled"})
+        return super().chat(extra_kwargs=extra, **kwargs)
+
+
+def _make_llm(model: str):
+    if model.startswith(_CLAUDE5_PREFIXES):
+        return _Claude5LLM(model=model, caching="ephemeral")
+    return anthropic.LLM(model=model, temperature=0.7, caching="ephemeral")
+
 
 # Délai de silence (secondes) avant relance puis raccrochage.
 INACTIVITY_TIMEOUT = 10.0
@@ -181,6 +206,7 @@ async def entrypoint(ctx: agents.JobContext):
     reset_call_state()
     raphael_phone = os.environ.get("RAPHAEL_PHONE", "")
     caller = ""
+    participant = None
     try:
         participant = await ctx.wait_for_participant()
         caller = participant.attributes.get("sip.phoneNumber", "")
@@ -209,12 +235,12 @@ async def entrypoint(ctx: agents.JobContext):
 
     # Modele par appel : entrant => Sonnet (qualite, besoin imprevisible) ;
     # sortant => choix passe dans le metadata (defaut Haiku, sinon LLM_MODEL).
-    _MODEL_MAP = {"haiku": "claude-haiku-4-5", "sonnet": "claude-sonnet-4-6"}
+    _MODEL_MAP = {"haiku": "claude-haiku-4-5", "sonnet": "claude-sonnet-5"}
     if is_outbound:
         _m = call_ctx.get("model") or os.environ.get("LLM_MODEL") or "sonnet"
-        llm_model = _MODEL_MAP.get(_m, _m if _m.startswith("claude") else "claude-sonnet-4-6")
+        llm_model = _MODEL_MAP.get(_m, _m if _m.startswith("claude") else "claude-sonnet-5")
     else:
-        llm_model = "claude-sonnet-4-6"
+        llm_model = "claude-sonnet-5"
     logger.info("LLM pour cet appel: %s (outbound=%s)", llm_model, is_outbound)
 
     # --- Compte-rendu garanti : callback shutdown enregistre AU PLUS TOT ------
@@ -289,20 +315,22 @@ CONTEXTE DE CET APPEL (SORTANT) :
                 numerals=True,
             )
             if os.environ.get("OTP_CAPTURE_MODE", "").strip() in ("1", "true", "True")
-            else deepgram.STT(
-                model="nova-3",
-                base_url="https://api.eu.deepgram.com/v1/listen",
-                language="fr",
-                smart_format=True,
-                punctuate=True,
+            else deepgram.STTv2(
+                # Flux : STT conversationnel avec detection de fin de tour
+                # NATIVE (signaux appris, pas des seuils de silence). Le
+                # multilingue couvre le francais. Endpoint EU (/v2/listen).
+                model="flux-general-multi",
+                language_hint=["fr"],
+                base_url="wss://api.eu.deepgram.com/v2/listen",
+                # eager => generation preemptive des qu'un EoT probable ;
+                # eot releve en consequence (recommandation du plugin).
+                eager_eot_threshold=0.5,
+                eot_threshold=0.8,
             )
         ),
-        llm=anthropic.LLM(
-            # Modèle décidé par appel : entrant => Sonnet ; sortant => metadata.
-            model=llm_model,
-            temperature=0.7,
-            caching="ephemeral",
-        ),
+        # Modèle décidé par appel : entrant => Sonnet ; sortant => metadata.
+        # Claude 5 : pas de temperature, thinking désactivé (voir _make_llm).
+        llm=_make_llm(llm_model),
         tts=cartesia.TTS(
             model="sonic-3.6",
             voice=os.environ["CARTESIA_VOICE_ID"],
@@ -313,9 +341,14 @@ CONTEXTE DE CET APPEL (SORTANT) :
         # Remplace les anciens kwargs dépréciés (turn_detection / min|max_endpointing
         # _delay / preemptive_generation), qui se battaient entre eux.
         turn_handling=TurnHandlingOptions(
-            # Détecteur audio v1 complet (Cloud). PAS d'unlikely_threshold forcé :
-            # on garde les défauts calibrés par le serveur (les overrides dégradaient).
-            turn_detection=inference.TurnDetector(version="v1"),
+            # Mode normal : fin de tour decidee par Flux ("stt"), qui la
+            # detecte nativement. Mode OTP : nova-3 n'a pas d'EoT natif, on
+            # garde le detecteur audio v1 (Cloud), defauts serveur.
+            turn_detection=(
+                inference.TurnDetector(version="v1")
+                if os.environ.get("OTP_CAPTURE_MODE", "").strip() in ("1", "true", "True")
+                else "stt"
+            ),
             # Endpointing dynamique : le délai s'adapte à la conversation au lieu
             # d'un seuil fixe rigide. Bornes raisonnables pour éviter les blancs.
             endpointing=(
@@ -364,10 +397,13 @@ CONTEXTE DE CET APPEL (SORTANT) :
             instructions=prompt,
             tools=TOOLS,
         ),
-        # noise_cancellation désactivé : le plugin BVC n'est pas installé et le
-        # laisser actif peut bloquer silencieusement la publication audio.
+        # BVCTelephony : annulation de bruit + voix de fond, optimisee pour le
+        # telephone (plugin livekit-plugins-noise-cancellation, LiveKit Cloud).
         # delete_room_on_close ferme la room (et coupe la ligne) à la fin.
-        room_input_options=RoomInputOptions(delete_room_on_close=True),
+        room_input_options=RoomInputOptions(
+            delete_room_on_close=True,
+            noise_cancellation=noise_cancellation.BVCTelephony(),
+        ),
         # audio_enabled=True est le fix central : force la publication du track
         # audio de sortie de l'agent dans la room.
         room_output_options=RoomOutputOptions(
@@ -565,7 +601,61 @@ CONTEXTE DE CET APPEL (SORTANT) :
             "Présente-toi brièvement comme l'assistante de Raphaël "
             "et annonce l'objet de ton appel."
         )
-        await session.generate_reply(instructions=ouverture)
+        # --- AMD (answering machine detection) : humain / SVI / repondeur ----
+        # Classifie le decroche AVANT de derouler l'ouverture. Modeles LiveKit
+        # Inference par defaut (gemini flash-lite + ink-whisper). En cas de
+        # doute ou d'echec, on se comporte comme face a un humain.
+        cat = "uncertain"
+        try:
+            amd_kwargs = {}
+            if participant is not None:
+                amd_kwargs["participant_identity"] = participant.identity
+            async with AMD(session, **amd_kwargs) as detector:
+                amd_result = await detector.execute()
+            cat = getattr(getattr(amd_result, "category", None), "value", "uncertain") or "uncertain"
+        except Exception:
+            logger.exception("AMD indisponible, on continue comme avec un humain")
+        logger.info("AMD : %s", cat)
+        if cat == "machine-vm":
+            # Repondeur : laisser un message bref puis raccrocher.
+            handle = session.generate_reply(
+                instructions=(
+                    "Tu es tombée sur un répondeur (aucun humain ne t'écoute). "
+                    "Laisse UN message vocal bref et complet en une fois : qui tu es "
+                    "(l'assistante de Raphaël Nicolle), l'objet de l'appel — "
+                    + (objectif or "voir contexte") +
+                    " — et invite à rappeler. Termine par au revoir. "
+                    "Ne pose aucune question, n'attends aucune réponse."
+                )
+            )
+            try:
+                await handle.wait_for_playout()
+            except Exception:
+                logger.exception("Lecture du message repondeur interrompue")
+            try:
+                await write_journal_raw(
+                    "Appel sortant : répondeur — message laissé",
+                    "Objectif : " + (objectif or "?")[:300],
+                    "info",
+                )
+            except Exception:
+                logger.exception("Echec journal repondeur")
+            await _hangup()
+        elif cat == "machine-unavailable":
+            # Messagerie pleine / non configuree : rien a faire.
+            try:
+                await write_journal_raw(
+                    "Appel sortant : messagerie indisponible, aucun message possible",
+                    "Objectif : " + (objectif or "?")[:300],
+                    "erreur",
+                )
+            except Exception:
+                logger.exception("Echec journal messagerie indisponible")
+            await _hangup()
+        else:
+            # humain / incertain / SVI (la navigation SVI de l'AMD demarre
+            # toute seule pour machine-ivr) : derouler l'ouverture normale.
+            await session.generate_reply(instructions=ouverture)
     else:
         # Mode capture OTP : pour un appel de vérification (WhatsApp, etc.), on ne
         # dialogue PAS. L'agent reste silencieux et se contente d'écouter, ce qui

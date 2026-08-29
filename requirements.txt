@@ -1,4 +1,6 @@
-livekit-agents[anthropic,deepgram,cartesia,silero,turn-detector,mcp]>=1.5.0
+livekit-agents[anthropic,deepgram,cartesia,silero,turn-detector,mcp]>=1.7.1
+anthropic>=0.41,<1.0  # 1.x exige httpx2, incompatible avec livekit-plugins-anthropic 1.7.1 (passe un httpx.AsyncClient)
+livekit-plugins-noise-cancellation>=0.3.0
 python-dotenv>=1.0.0
 httpx>=0.27.0
 google-auth>=2.29.0
