@@ -93,6 +93,7 @@ def _make_llm(model: str):
 # Délai de silence (secondes) avant relance puis raccrochage.
 INACTIVITY_TIMEOUT = 10.0
 
+# Jeu COMPLET : appel entrant de Raphael identifie. Il peut tout demander.
 TOOLS = [
     get_calendar_events,
     create_calendar_event,
@@ -112,6 +113,21 @@ TOOLS = [
     lister_connecteurs,
     lister_outils,
     utiliser_connecteur,
+]
+
+# Jeu RESTREINT : appel sortant, ou entrant d'un inconnu. Tout ce qui est retire
+# ici serait de toute facon refuse (la passerelle rend palier 0, les outils
+# sensibles renvoient _ACCESS_DENIED) : on paie leur schema a chaque tour pour
+# rien. Mesure du 29/08 : ~5000 des 7000 tokens de prompt venaient des schemas.
+# verifier_identite reste, sans quoi un appelant legitime n'aurait aucun moyen
+# de se faire reconnaitre et de debloquer le jeu complet.
+TOOLS_RESTREINT = [
+    get_current_datetime,
+    read_brain,
+    write_journal,
+    end_call,
+    verifier_identite,
+    envoyer_touches,
 ]
 
 
@@ -243,12 +259,12 @@ async def entrypoint(ctx: agents.JobContext):
     # Modele par appel : entrant => Sonnet (qualite, besoin imprevisible) ;
     # sortant => choix passe dans le metadata (defaut Haiku, sinon LLM_MODEL).
     _MODEL_MAP = {"haiku": "claude-haiku-4-5", "sonnet": "claude-sonnet-5"}
-    _DEFAUT = os.environ.get("VOICE_LLM", "haiku")
+    _DEFAUT = os.environ.get("VOICE_LLM", "sonnet")
     if is_outbound:
         _m = call_ctx.get("model") or os.environ.get("LLM_MODEL") or _DEFAUT
     else:
         _m = _DEFAUT
-    llm_model = _MODEL_MAP.get(_m, _m if _m.startswith("claude") else "claude-haiku-4-5")
+    llm_model = _MODEL_MAP.get(_m, _m if _m.startswith("claude") else "claude-sonnet-5")
     logger.info("LLM pour cet appel: %s (outbound=%s)", llm_model, is_outbound)
 
     # --- Compte-rendu garanti : callback shutdown enregistre AU PLUS TOT ------
@@ -305,8 +321,10 @@ CONTEXTE DE CET APPEL (SORTANT) :
     # Attachés UNIQUEMENT si l'appelant est identifié comme Raphaël. Appelant
     # inconnu OU appel sortant (l'appelé n'est pas Raphaël) => aucun serveur MCP,
     # pour ne jamais exposer ces outils à un tiers.
-    mcp_servers = (await _build_mcp_servers()) if is_raphael() else []
-    logger.info("Serveurs MCP attachés: %d (is_raphael=%s)", len(mcp_servers), is_raphael())
+    mcp_servers = (await _build_mcp_servers()) if (is_raphael() and not is_outbound) else []
+    logger.info("Serveurs MCP attachés: %d (is_raphael=%s, sortant=%s, outils=%d)",
+                len(mcp_servers), is_raphael(), is_outbound,
+                len(TOOLS if (is_raphael() and not is_outbound) else TOOLS_RESTREINT))
 
     session = AgentSession(
         stt=(
@@ -408,7 +426,7 @@ CONTEXTE DE CET APPEL (SORTANT) :
         room=ctx.room,
         agent=Agent(
             instructions=prompt,
-            tools=TOOLS,
+            tools=(TOOLS if (is_raphael() and not is_outbound) else TOOLS_RESTREINT),
         ),
         # BVCTelephony : annulation de bruit + voix de fond, optimisee pour le
         # telephone (plugin livekit-plugins-noise-cancellation, LiveKit Cloud).
@@ -618,16 +636,49 @@ CONTEXTE DE CET APPEL (SORTANT) :
         # Classifie le decroche AVANT de derouler l'ouverture. Modeles LiveKit
         # Inference par defaut (gemini flash-lite + ink-whisper). En cas de
         # doute ou d'echec, on se comporte comme face a un humain.
+        # AMD desactive par defaut (constat du 29/08/2026, trois appels muets).
+        # Le plugin verrouille la parole de l'agent tant qu'il n'a pas conclu, et
+        # il est concu pour demarrer AVANT la composition du numero. Ici c'est
+        # voicecallmcp qui compose : l'agent arrive apres le decroche, l'AMD rate
+        # le debut, tarde a conclure, et le verrou n'est pas toujours rendu — on
+        # a vu l'interlocuteur repeter « allo, je n'entends rien » pendant que
+        # l'agent restait muet. Le detecter correctement suppose de deplacer le
+        # dial SIP dans l'agent : chantier, pas reglage. Mettre AMD_ENABLED=1
+        # pour le reactiver (il fonctionne : un repondeur a bien ete classe
+        # machine-vm et le message laisse).
         cat = "uncertain"
+        _amd_on = os.environ.get("AMD_ENABLED", "").strip() in ("1", "true", "True")
         try:
-            amd_kwargs = {}
+            if not _amd_on:
+                raise RuntimeError("AMD desactive (AMD_ENABLED absent)")
+            # Seuils resserres (constat du 29/08/2026, en appel reel). Les
+            # defauts du plugin (parole humaine 2,5 s, pas-de-parole 10 s,
+            # plafond 20 s) supposent que l'AMD demarre AVANT la composition
+            # du numero et entende toute la sonnerie. Ici c'est voicecallmcp
+            # qui compose : l'agent arrive une fois la ligne ouverte, l'AMD
+            # rate le debut et attend son plafond. Resultat observe : 35 s de
+            # silence total pendant que l'interlocuteur repetait « allo ».
+            # L'AMD met la parole en pause tant qu'il n'a pas conclu, donc son
+            # plafond EST le silence initial de l'appel : on le borne a 3,5 s.
+            amd_kwargs = {
+                "wait_until_finished": False,  # sinon le plafond ne borne plus rien
+                "detection_options": {
+                    "human_speech_threshold": 1.0,   # un « allo » suffit
+                    "human_silence_threshold": 0.4,
+                    "no_speech_threshold": 2.5,
+                    "timeout": 3.5,                  # plafond dur du silence initial
+                },
+            }
             if participant is not None:
                 amd_kwargs["participant_identity"] = participant.identity
             async with AMD(session, **amd_kwargs) as detector:
                 amd_result = await detector.execute()
             cat = getattr(getattr(amd_result, "category", None), "value", "uncertain") or "uncertain"
-        except Exception:
-            logger.exception("AMD indisponible, on continue comme avec un humain")
+        except Exception as _amd_exc:
+            if _amd_on:
+                logger.exception("AMD indisponible, on continue comme avec un humain")
+            else:
+                logger.info("AMD : %s", _amd_exc)
         logger.info("AMD : %s", cat)
         if cat == "machine-vm":
             # Repondeur : laisser un message bref puis raccrocher.

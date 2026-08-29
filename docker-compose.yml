@@ -1,7 +1,10 @@
 services:
   voice-agent:
-    mem_limit: 1536m
-    memswap_limit: 1536m
+    # 1536m depuis l origine ; la noise cancellation BVC charge son modele dans
+    # CHAQUE process de job preteint, ce qui faisait tuer les workers par l OOM
+    # killer (exit -9) et rendait l agent muet apres le decroche (29/08/2026).
+    mem_limit: 4g
+    memswap_limit: 4g
     build: .
     restart: unless-stopped
     env_file: .env
