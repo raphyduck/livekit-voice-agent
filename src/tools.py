@@ -1,3 +1,4 @@
+import json
 import os
 import asyncio
 import logging
@@ -21,7 +22,7 @@ WRITE_TIMEOUT = 15.0
 # ---------------------------------------------------------------------------
 # Le worker traite un appel par process : une variable de module est donc
 # acceptable ici. On la remet à False au début de chaque appel (reset_identity).
-_IDENTITY = {"is_raphael": False}
+_IDENTITY = {"is_raphael": False, "mdp_verifie": False}
 
 # Message neutre renvoyé par les outils sensibles tant que l'identité n'est pas
 # confirmée (ne révèle rien sur l'existence d'un mot de passe).
@@ -32,11 +33,20 @@ _ACCESS_DENIED = (
 
 
 def reset_identity(value: bool = False) -> None:
+    # is_raphael : presomption (caller ID), falsifiable.
+    # mdp_verifie : preuve (mot de passe vocal), le seul fait qui ouvre le
+    #   palier 2 de la passerelle. Remis a zero a chaque appel, jamais deduit
+    #   du caller ID — sinon usurper un numero suffirait a lire les comptes.
     _IDENTITY["is_raphael"] = value
+    _IDENTITY["mdp_verifie"] = False
 
 
 def is_raphael() -> bool:
     return _IDENTITY["is_raphael"]
+
+
+def mdp_verifie() -> bool:
+    return bool(_IDENTITY.get("mdp_verifie"))
 
 # Etat par appel : un compte-rendu a-t-il deja ete ecrit ?
 # journal_page_id : id de la page Journal creee pour CET appel (idempotence).
@@ -563,6 +573,8 @@ async def verifier_identite(mot_de_passe: str) -> str:
     expected = os.environ.get("RAPHAEL_VOICE_PASSWORD", "")
     if expected and mot_de_passe.strip().lower() == expected.strip().lower():
         _IDENTITY["is_raphael"] = True
+        _IDENTITY["mdp_verifie"] = True
+        logger.info("Identite verifiee par mot de passe vocal (palier 2 ouvert)")
         return "Identité confirmée. Bonjour Raphaël."
     return (
         "Mot de passe incorrect. Je ne peux pas vous donner accès aux "
@@ -619,3 +631,122 @@ async def append_journal_transcript(transcript: str) -> None:
     prev = _CALL_STATE.get("journal_detail") or ""
     _CALL_STATE["journal_detail"] = (prev + "\n\nTranscript de l'appel :\n" + texte)[:20000]
     await flush_journal()
+
+
+# ---------------------------------------------------------------------------
+# Passerelle connecteurs (29/08/2026)
+# ---------------------------------------------------------------------------
+# Trois outils seulement, quel que soit le nombre de connecteurs : le catalogue
+# se decouvre a l'appel au lieu de peser dans le prompt de chaque tour. Le
+# palier d'habilitation est recalcule a CHAQUE appel depuis l'etat d'identite
+# de la session — jamais mis en cache, pour qu'une identite non confirmee ne
+# puisse pas etre rejouee.
+from . import connecteurs as _cx
+
+
+def _palier_courant() -> int:
+    """0 = personne d'identifie, 1 = caller ID Raphael, 2 = mot de passe verifie."""
+    if not is_raphael():
+        return 0
+    return 2 if mdp_verifie() else 1
+
+
+@function_tool()
+async def lister_connecteurs() -> str:
+    """Liste les connecteurs de donnees accessibles pendant CET appel.
+
+    A appeler quand tu as besoin d'une information que tes outils habituels ne
+    couvrent pas : banque, crypto, fichiers, photos, bibliotheque, messageries,
+    fiches du cerveau. Renvoie aussi ce qu'il faudrait pour en ouvrir davantage.
+    """
+    palier = _palier_courant()
+    if palier == 0:
+        return ("Aucun connecteur pendant cet appel : ton interlocuteur n'est pas "
+                "identifie comme Raphael. C'est voulu, n'insiste pas et ne le "
+                "mentionne pas.")
+    dispo = _cx.connecteurs_disponibles(palier)
+    lignes = [f"- {nom} : {cfg['resume']}" for nom, cfg in sorted(dispo.items())]
+    verrouilles = sorted(
+        nom for nom, cfg in _cx.REGISTRE.items()
+        if cfg["palier"] > palier and _cx._env(nom, "URL")
+    )
+    txt = "Connecteurs accessibles maintenant :\n" + "\n".join(lignes)
+    if verrouilles:
+        txt += ("\n\nDemandent le mot de passe vocal (outil verifier_identite) : "
+                + ", ".join(verrouilles))
+    txt += "\n\nEnsuite : lister_outils(connecteur) puis utiliser_connecteur(...)."
+    return txt
+
+
+@function_tool()
+async def lister_outils(connecteur: str) -> str:
+    """Detaille les outils d'un connecteur et leurs parametres.
+
+    Args:
+        connecteur: Nom rendu par lister_connecteurs (ex. "qonto", "memoire").
+    """
+    palier = _palier_courant()
+    dispo = _cx.connecteurs_disponibles(palier)
+    if connecteur not in dispo:
+        return (f"« {connecteur} » n'est pas accessible a ce niveau. "
+                "Appelle lister_connecteurs pour voir ce qui est ouvert.")
+    try:
+        distants = await _cx.lister_outils_distants(connecteur)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("lister_outils %s", connecteur)
+        return f"Connecteur {connecteur} injoignable : {e}"
+    autorises = _cx.REGISTRE[connecteur]["outils"]
+    lignes = []
+    for o in distants:
+        nom = o.get("name", "")
+        court = nom.split("_", 1)[1] if nom.startswith(connecteur + "_") else nom
+        if court not in autorises and nom not in autorises:
+            continue
+        params = ", ".join((o.get("inputSchema") or {}).get("properties", {}).keys())
+        lignes.append(f"- {nom}({params}) : {(o.get('description') or '')[:150]}")
+    if not lignes:
+        return f"Aucun outil autorise expose par {connecteur}."
+    return f"Outils de {connecteur} :\n" + "\n".join(lignes)
+
+
+@function_tool()
+async def utiliser_connecteur(connecteur: str, outil: str, arguments: str = "{}") -> str:
+    """Appelle un outil d'un connecteur et renvoie son resultat.
+
+    Previens ton interlocuteur que tu regardes ("je vous regarde ca") AVANT
+    d'appeler : la reponse peut prendre quelques secondes.
+
+    Args:
+        connecteur: Nom du connecteur (voir lister_connecteurs).
+        outil: Nom exact de l'outil (voir lister_outils).
+        arguments: Arguments au format JSON, ex. '{"limit": 5}'. "{}" si aucun.
+    """
+    palier = _palier_courant()
+    dispo = _cx.connecteurs_disponibles(palier)
+    if connecteur not in dispo:
+        if connecteur in _cx.REGISTRE and palier == 1:
+            return (f"« {connecteur} » touche a des donnees sensibles : demande a "
+                    "Raphael son mot de passe vocal, puis appelle verifier_identite.")
+        return (f"« {connecteur} » n'est pas accessible pendant cet appel. "
+                "Appelle lister_connecteurs.")
+    ok, detail = _cx.outil_autorise(connecteur, outil)
+    if not ok:
+        logger.warning("Passerelle : refus %s/%s (%s)", connecteur, outil, detail)
+        return f"Refuse : {detail}"
+    try:
+        args = json.loads(arguments) if isinstance(arguments, str) else (arguments or {})
+        if not isinstance(args, dict):
+            return "Les arguments doivent etre un objet JSON, ex. '{\"limit\": 5}'."
+    except Exception:  # noqa: BLE001
+        return f"Arguments JSON illisibles : {arguments[:120]}"
+    logger.info("Passerelle : %s/%s palier=%d args=%s", connecteur, outil, palier,
+                str(args)[:120])
+    try:
+        res = await _cx.appeler_outil(connecteur, outil, args)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Passerelle %s/%s", connecteur, outil)
+        return f"Le connecteur {connecteur} a echoue : {e}"
+    # Au telephone, un pave est inexploitable : on borne et on le dit.
+    if len(res) > 3000:
+        res = res[:3000] + "\n[...] (resultat tronque, affine ta demande)"
+    return res or "(reponse vide)"

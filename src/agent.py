@@ -40,6 +40,9 @@ from .tools import (
     write_journal_raw,
     journal_page_id,
     append_journal_transcript,
+    lister_connecteurs,
+    lister_outils,
+    utiliser_connecteur,
 )
 
 load_dotenv()
@@ -105,6 +108,10 @@ TOOLS = [
     end_call,
     verifier_identite,
     envoyer_touches,
+    # Passerelle : trois outils, quel que soit le nombre de connecteurs.
+    lister_connecteurs,
+    lister_outils,
+    utiliser_connecteur,
 ]
 
 
@@ -236,11 +243,12 @@ async def entrypoint(ctx: agents.JobContext):
     # Modele par appel : entrant => Sonnet (qualite, besoin imprevisible) ;
     # sortant => choix passe dans le metadata (defaut Haiku, sinon LLM_MODEL).
     _MODEL_MAP = {"haiku": "claude-haiku-4-5", "sonnet": "claude-sonnet-5"}
+    _DEFAUT = os.environ.get("VOICE_LLM", "haiku")
     if is_outbound:
-        _m = call_ctx.get("model") or os.environ.get("LLM_MODEL") or "sonnet"
-        llm_model = _MODEL_MAP.get(_m, _m if _m.startswith("claude") else "claude-sonnet-5")
+        _m = call_ctx.get("model") or os.environ.get("LLM_MODEL") or _DEFAUT
     else:
-        llm_model = "claude-sonnet-5"
+        _m = _DEFAUT
+    llm_model = _MODEL_MAP.get(_m, _m if _m.startswith("claude") else "claude-haiku-4-5")
     logger.info("LLM pour cet appel: %s (outbound=%s)", llm_model, is_outbound)
 
     # --- Compte-rendu garanti : callback shutdown enregistre AU PLUS TOT ------
@@ -324,8 +332,13 @@ CONTEXTE DE CET APPEL (SORTANT) :
                 base_url="wss://api.eu.deepgram.com/v2/listen",
                 # eager => generation preemptive des qu'un EoT probable ;
                 # eot releve en consequence (recommandation du plugin).
-                eager_eot_threshold=0.5,
-                eot_threshold=0.8,
+                # Mesure du 29/08 : end_of_utterance_delay de 0,4 a 1,25 s
+                # avec 0.5/0.8. On avance les deux seuils d'un cran : la
+                # generation preemptive part plus tot et la fin de tour est
+                # actee plus vite, sans tomber sous les valeurs ou Flux
+                # commence a couper la parole.
+                eager_eot_threshold=0.4,
+                eot_threshold=0.7,
             )
         ),
         # Modèle décidé par appel : entrant => Sonnet ; sortant => metadata.
