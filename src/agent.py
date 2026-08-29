@@ -304,7 +304,7 @@ CONTEXTE DE CET APPEL (SORTANT) :
             caching="ephemeral",
         ),
         tts=cartesia.TTS(
-            model="sonic-3",
+            model="sonic-3.6",
             voice=os.environ["CARTESIA_VOICE_ID"],
             language="fr",
         ),
