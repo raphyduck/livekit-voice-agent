@@ -491,7 +491,7 @@ CONTEXTE DE CET APPEL (SORTANT) :
             # Génération préemptive : le LLM démarre pendant que l'utilisateur finit.
             preemptive_generation=PreemptiveGenerationOptions(enabled=True),
         ),
-        # Serveurs MCP (navigateur + WhatsApp), uniquement pour Raphaël identifié.
+        # Serveurs MCP (WhatsApp seul depuis le 30/08), uniquement pour Raphaël identifié.
         mcp_servers=mcp_servers,
     )
 
