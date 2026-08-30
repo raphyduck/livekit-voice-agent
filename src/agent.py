@@ -100,11 +100,11 @@ def _make_llm(model: str):
         cle = os.environ.get("LITELLM_KEY", "")
         if not cle:
             logger.error("LITELLM_KEY absente, repli sur claude-sonnet-5")
-            return _Claude5LLM(model="claude-sonnet-5", caching="ephemeral", _strict_tool_schema=False)
+            return _Claude5LLM(model="claude-sonnet-5", caching="ephemeral")
         return openai.LLM(model=model, base_url=base, api_key=cle, temperature=0.6)
     if model.startswith(_CLAUDE5_PREFIXES):
-        return _Claude5LLM(model=model, caching="ephemeral", _strict_tool_schema=False)
-    return anthropic.LLM(model=model, temperature=0.7, caching="ephemeral", _strict_tool_schema=False)
+        return _Claude5LLM(model=model, caching="ephemeral")
+    return anthropic.LLM(model=model, temperature=0.7, caching="ephemeral")
 
 
 MODELES = {
@@ -238,25 +238,19 @@ async def _probe_mcp(url: str, headers: dict | None = None, timeout: float = 6.0
 async def _build_mcp_servers() -> list:
     """Serveurs MCP self-hosted attachés UNIQUEMENT pour Raphaël identifié.
 
-    Navigateur (human-browser) + WhatsApp. IMAP reste géré par les outils codés
+    WhatsApp uniquement. IMAP reste géré par les outils codés
     (get_unread_emails/send_email) pour éviter le doublon. Bitwarden est exclu.
+
+    Le MCP navigateur (human-browser) a été retiré le 30/08/2026 : ses 23 outils
+    portaient à 40 le nombre d'outils exposés en appel entrant, ce qui faisait
+    dépasser le budget de complexité des schémas chez Anthropic (400 « Schema is
+    too complex », agent muet). Piloter un navigateur à la voix n'a par ailleurs
+    guère de sens.
 
     Chaque serveur est probé avant d'être attaché : un serveur injoignable est
     ignoré (avec log) au lieu de faire planter le setup des outils.
     """
     servers = []
-    brmcp_url = os.environ.get("BRMCP_URL")
-    brmcp_token = os.environ.get("BRMCP_TOKEN")
-    if brmcp_url and brmcp_token:
-        brmcp_headers = {"Authorization": f"Bearer {brmcp_token}"}
-        if await _probe_mcp(brmcp_url, brmcp_headers):
-            servers.append(
-                mcp.MCPServerHTTP(
-                    url=brmcp_url,
-                    headers=brmcp_headers,
-                    client_session_timeout_seconds=10,
-                )
-            )
     wa_url = os.environ.get("WA_MCP_URL")
     if wa_url:
         # WhatsApp : le secret est déjà dans l'URL, pas de header.
