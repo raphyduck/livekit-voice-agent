@@ -100,11 +100,11 @@ def _make_llm(model: str):
         cle = os.environ.get("LITELLM_KEY", "")
         if not cle:
             logger.error("LITELLM_KEY absente, repli sur claude-sonnet-5")
-            return _Claude5LLM(model="claude-sonnet-5", caching="ephemeral")
+            return _Claude5LLM(model="claude-sonnet-5", caching="ephemeral", _strict_tool_schema=False)
         return openai.LLM(model=model, base_url=base, api_key=cle, temperature=0.6)
     if model.startswith(_CLAUDE5_PREFIXES):
-        return _Claude5LLM(model=model, caching="ephemeral")
-    return anthropic.LLM(model=model, temperature=0.7, caching="ephemeral")
+        return _Claude5LLM(model=model, caching="ephemeral", _strict_tool_schema=False)
+    return anthropic.LLM(model=model, temperature=0.7, caching="ephemeral", _strict_tool_schema=False)
 
 
 MODELES = {
