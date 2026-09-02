@@ -22,6 +22,7 @@ from livekit.plugins import (
 )
 from livekit.agents.voice.amd import AMD
 
+from . import connecteurs as _cx
 from .system_prompt import get_system_prompt
 from .tools import (
     add_task,
@@ -70,6 +71,12 @@ def _trace_sur_disque() -> None:
         chemin = os.path.join(
             dossier, "agent-" + datetime.date.today().isoformat() + ".log")
         racine = logging.getLogger()
+        # Le module est importe deux fois dans un process de job (sous son nom
+        # de package et comme point d'entree) : sans marqueur porte par le
+        # logger lui-meme, chaque copie ajoute son handler et chaque ligne
+        # apparait en double dans le fichier.
+        if getattr(racine, "_trace_hobbitton", None) == chemin:
+            return
         if any(getattr(h, "baseFilename", None) == chemin for h in racine.handlers):
             return
         h = logging.FileHandler(chemin, encoding="utf-8")
@@ -77,6 +84,7 @@ def _trace_sur_disque() -> None:
         h.setFormatter(logging.Formatter(
             "%(asctime)s %(levelname)s [%(process)d] %(name)s: %(message)s"))
         racine.addHandler(h)
+        racine._trace_hobbitton = chemin
         # Menage : au-dela de 14 jours, la trace n'a plus d'usage.
         limite = datetime.date.today() - datetime.timedelta(days=14)
         for f in os.listdir(dossier):
@@ -630,6 +638,40 @@ CONTEXTE DE CET APPEL (SORTANT) :
         ),
     )
 
+    # --- Comment cet appel s'est-il termine ? ----------------------------
+    # Le 02/09/2026, un appel entrant a ete coupe en plein echange et PERSONNE
+    # n'a rien su : les appels entrants ne produisaient aucun compte-rendu, donc
+    # une coupure anormale laissait exactement la meme trace qu'un appel reussi,
+    # c'est-a-dire aucune. On qualifie desormais chaque fin d'appel, on la
+    # journalise toujours, et on alerte quand elle est anormale.
+    fin = {
+        "cause": None,        # qui a mis fin : nous, l'interlocuteur, ou personne
+        "motif_room": None,   # motif de deconnexion rendu par LiveKit
+        "parlait": False,     # l'agent avait-il la parole au moment de la coupure
+        "incidents": [],      # erreurs survenues pendant l'appel
+    }
+
+    class _Incidents(logging.Handler):
+        """Retient les erreurs de l'appel pour les joindre au compte-rendu.
+
+        Les blancs et les tours perdus se voient dans les logs du framework
+        (parole annulee, delai LLM depasse) mais ne remontaient nulle part.
+        """
+
+        def emit(self, record):
+            try:
+                if record.levelno < logging.ERROR:
+                    return
+                msg = record.getMessage()[:200]
+                if msg not in fin["incidents"]:
+                    fin["incidents"].append(msg)
+                    del fin["incidents"][8:]
+            except Exception:  # noqa: BLE001
+                pass
+
+    _collecteur = _Incidents(level=logging.ERROR)
+    logging.getLogger().addHandler(_collecteur)
+
     # --- Qui a coupe la ligne ? ------------------------------------------
     # L'appel du 02/09/2026 12h32 s'est termine sans qu'on puisse dire si
     # l'interlocuteur avait raccroche, si la branche SIP etait tombee ou si
@@ -641,12 +683,22 @@ CONTEXTE DE CET APPEL (SORTANT) :
             motif = getattr(getattr(p, "_info", None), "disconnect_reason", None)
             logger.info("Participant parti : %s (identite=%s, motif=%s)",
                         getattr(p, "name", "?"), getattr(p, "identity", "?"), motif)
+            if fin["cause"] is None:
+                fin["cause"] = "interlocuteur"
+                fin["motif_room"] = str(motif)
+                fin["parlait"] = (getattr(session, "agent_state", "") == "speaking")
         except Exception:  # noqa: BLE001
             logger.exception("trace participant_disconnected")
 
     @ctx.room.on("disconnected")
     def _on_room_disconnected(*args):
         logger.info("Room deconnectee (motif=%s)", args[0] if args else "?")
+        if fin["cause"] is None:
+            # Ni raccrochage de notre part, ni depart de l'interlocuteur : la
+            # ligne est tombee. C'est exactement le cas du 02/09 12h32.
+            fin["cause"] = "coupure"
+            fin["motif_room"] = str(args[0]) if args else "?"
+            fin["parlait"] = (getattr(session, "agent_state", "") == "speaking")
 
     @ctx.room.on("reconnecting")
     def _on_room_reconnecting(*_):
@@ -701,6 +753,7 @@ CONTEXTE DE CET APPEL (SORTANT) :
         if raccrochage_engage:
             return
         raccrochage_engage = True
+        fin["cause"] = "agent"
         _cancel_inactivity()
         try:
             # Laisser finir la phrase en cours, mais jamais plus de 6 secondes.
@@ -832,6 +885,10 @@ CONTEXTE DE CET APPEL (SORTANT) :
                          or "?")
             if type_maj in ("tool_call_started", "tool_call_ended"):
                 logger.info("Outil %s : %s", type_maj.replace("tool_call_", ""), nom_outil)
+            if type_maj == "tool_call_started" and nom_outil == "end_call":
+                # end_call supprime la room sans passer par _hangup : sans cela
+                # un raccrochage voulu par le modele serait pris pour une coupure.
+                fin["cause"] = "agent" 
             if type_maj == "tool_call_started":
                 outils_en_cours += 1
                 _cancel_inactivity()
@@ -901,14 +958,35 @@ CONTEXTE DE CET APPEL (SORTANT) :
                     logger.info("Mode OTP : instruction detectee dans '%s' -> touche %s", joined[-80:], d)
                     asyncio.create_task(_press(d))
 
-    # --- Fin d'appel : on persiste TOUJOURS le transcript (appel sortant) -----
+    async def _alerter_raphael(entete: str, transcript: str) -> None:
+        """Previent Raphael quand un appel s'est mal termine.
+
+        Va au chat « Note to self » de Beeper (chatID 88), canal des alertes
+        d'agents. Un echec d'envoi ne doit jamais faire echouer la fin d'appel :
+        on le signale dans les logs et on continue.
+        """
+        try:
+            NL = chr(10)
+            derniers = NL.join((transcript or "").split(NL)[-6:])
+            texte = ("Appel a surveiller — " + entete + NL + NL
+                     + "Fin de conversation :" + NL + derniers)
+            await _cx.appeler_outil("beeper", "send_message",
+                                    {"chatID": os.environ.get("BEEPER_ALERT_CHAT", "88"),
+                                     "text": texte[:1500]})
+            logger.info("Alerte de fin d'appel envoyee a Raphael (Beeper).")
+        except Exception:  # noqa: BLE001
+            logger.warning("Alerte Beeper impossible, l'appel reste au journal",
+                           exc_info=True)
+
+    # --- Fin d'appel : on persiste TOUJOURS le transcript ---------------------
     # Le transcript est ajoute comme contenu de l'entree Journal UNIQUE de
     # l'appel (idempotence cote write_journal). append_journal_transcript cree
     # l'entree si aucune n'existe encore (ex. raccroche avant tout compte-rendu).
     async def _journal_fin_appel():
         try:
-            if not is_outbound:
-                return
+            # Les appels ENTRANTS etaient exclus du compte-rendu : une coupure
+            # anormale ne laissait donc aucune trace (02/09/2026). Ils sont
+            # desormais journalises comme les sortants.
             NL = chr(10)
             # Source principale : capture live (fiable même si raccroche brutal).
             lignes = list(live_transcript)
@@ -932,9 +1010,46 @@ CONTEXTE DE CET APPEL (SORTANT) :
                 except Exception:
                     logger.exception("transcript illisible au shutdown (repli history)")
             transcript = NL.join(lignes) if lignes else "(aucun echange capte)"
+
+            cause = fin["cause"] or "coupure"
+            dit_par = {
+                "agent": "l'agent a raccroche",
+                "interlocuteur": "l'interlocuteur a raccroche",
+                "coupure": "LIGNE COUPEE (ni raccrochage de l'agent, "
+                           "ni depart de l'interlocuteur)",
+            }[cause]
+            # Anormal : la ligne tombe sans que personne n'ait raccroche, ou
+            # elle se coupe alors que l'agent avait encore la parole, ou une
+            # erreur est survenue pendant l'appel.
+            anormal = (cause == "coupure") or fin["parlait"] or bool(fin["incidents"])
+            entete = ("Appel %s avec %s — %s%s."
+                      % ("sortant" if is_outbound else "entrant",
+                         caller or ctx.room.name,
+                         dit_par,
+                         " alors que l'agent parlait" if fin["parlait"] else ""))
+            if fin["motif_room"]:
+                entete += " Motif LiveKit : %s." % fin["motif_room"]
+            if fin["incidents"]:
+                entete += " Incidents pendant l'appel : " + " | ".join(fin["incidents"])
+            logger.info("Fin d'appel : %s (anormal=%s)", entete, anormal)
+
+            await write_journal_raw(
+                ("Appel %s termine anormalement" if anormal
+                 else "Appel %s termine") % ("sortant" if is_outbound else "entrant"),
+                entete,
+                "erreur" if anormal else "info",
+            )
             await append_journal_transcript(transcript)
+
+            if anormal:
+                await _alerter_raphael(entete, transcript)
         except Exception:
             logger.exception("Echec compte-rendu auto au shutdown")
+        finally:
+            try:
+                logging.getLogger().removeHandler(_collecteur)
+            except Exception:  # noqa: BLE001
+                pass
     
     _fin_appel_impl["fn"] = _journal_fin_appel
     
