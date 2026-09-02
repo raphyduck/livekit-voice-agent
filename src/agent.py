@@ -95,6 +95,11 @@ def _make_llm(model: str):
     la meme passerelle que LibreChat : cela ouvre les 18 modeles du serveur sans
     ecrire un client par fournisseur.
     """
+    if "/" in model:
+        # Modeles heberges LiveKit Inference (ex. google/gemma-4-31b-it) :
+        # gateway OpenAI-compatible de LiveKit Cloud, jeton minté automatiquement
+        # depuis LIVEKIT_API_KEY/SECRET — aucun compte fournisseur ni passerelle.
+        return inference.LLM(model=model, extra_kwargs={"temperature": 0.6})
     if not model.startswith("claude"):
         base = os.environ.get("LITELLM_URL", "http://127.0.0.1:4000/v1")
         cle = os.environ.get("LITELLM_KEY", "")
@@ -112,21 +117,27 @@ MODELES = {
     "sonnet": "claude-sonnet-5",
     "opus": "claude-opus-5",
     "terra": "gpt-5.6-terra",
+    "gemma": "google/gemma-4-31b-it",
     "luna": "gpt-5.6-luna",
 }
-# Defaut valide par Raphael en appel reel le 29/08/2026, dans les DEUX sens.
+# Defaut passe a gemma (LiveKit Inference) le 02/09/2026 sur decision de
+# Raphael, apres rejeu du banc : TTFT 0,33-0,38 s (vs 0,70 haiku), outils 6/6
+# sur deux passes (haiku 5/6, terra 4/6 le meme jour), completions outils en
+# 0,3-0,5 s. Points a surveiller en appel reel : restitution des numeros
+# dictes, glissements tu/vous. Retour arriere : LLM_MODEL=claude-haiku-4-5.
+# Precedent defaut, valide par Raphael en appel reel le 29/08/2026 :
 # Mesure decisive : le TTFT doit se comparer AVEC les outils, puisque l'agent
 # en a toujours. haiku-4-5 ne paie aucun surcout d'outillage (0,64 s avec
 # 9 outils, contre 1,29 s pour terra qui en paie 0,69). En appel reel :
 # TTFT median 1,09 s sur 16 tours.
-MODELE_DEFAUT = "haiku"
+MODELE_DEFAUT = "gemma"
 
 
 def _resoudre_modele(demande: str | None = None) -> str:
     """Nom d'API du modele pour cet appel. `demande` vient du metadata (sortant)."""
     m = demande or os.environ.get("LLM_MODEL") or os.environ.get("VOICE_LLM", MODELE_DEFAUT)
     return MODELES.get(
-        m, m if (m.startswith("claude") or m.startswith("gpt")) else MODELES[MODELE_DEFAUT]
+        m, m if (m.startswith("claude") or m.startswith("gpt") or "/" in m) else MODELES[MODELE_DEFAUT]
     )
 
 
