@@ -1,3 +1,4 @@
+import datetime
 import asyncio
 import json
 import re
@@ -52,6 +53,45 @@ from .tools import (
 
 load_dotenv()
 logger = logging.getLogger("voice-agent")
+
+
+def _trace_sur_disque() -> None:
+    """Double les logs dans /data/logs, qui survit au conteneur.
+
+    Les logs Docker meurent avec le conteneur : recreer l'image pour deployer
+    un correctif efface les traces de l'incident qu'on cherchait a comprendre
+    (perdu ainsi, le 02/09/2026, l'appel coupe de 12h32). /data est monte
+    depuis l'hote, un fichier par jour, sans rotation concurrente puisque
+    chaque process ajoute a la fin.
+    """
+    try:
+        dossier = os.environ.get("LOG_DIR", "/data/logs")
+        os.makedirs(dossier, exist_ok=True)
+        chemin = os.path.join(
+            dossier, "agent-" + datetime.date.today().isoformat() + ".log")
+        racine = logging.getLogger()
+        if any(getattr(h, "baseFilename", None) == chemin for h in racine.handlers):
+            return
+        h = logging.FileHandler(chemin, encoding="utf-8")
+        h.setLevel(logging.INFO)  # DEBUG remplirait le disque
+        h.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s [%(process)d] %(name)s: %(message)s"))
+        racine.addHandler(h)
+        # Menage : au-dela de 14 jours, la trace n'a plus d'usage.
+        limite = datetime.date.today() - datetime.timedelta(days=14)
+        for f in os.listdir(dossier):
+            if not (f.startswith("agent-") and f.endswith(".log")):
+                continue
+            try:
+                if datetime.date.fromisoformat(f[6:-4]) < limite:
+                    os.remove(os.path.join(dossier, f))
+            except ValueError:
+                pass
+    except Exception:  # noqa: BLE001
+        logger.warning("Trace sur disque indisponible, on continue", exc_info=True)
+
+
+_trace_sur_disque()
 
 # --- Correctif Haiku 4.5 (et autres Claude 4.x récents) -------------------
 # Le plugin livekit-plugins-anthropic 1.6.0 ne connaît pas claude-haiku-4-5.
@@ -590,6 +630,28 @@ CONTEXTE DE CET APPEL (SORTANT) :
         ),
     )
 
+    # --- Qui a coupe la ligne ? ------------------------------------------
+    # L'appel du 02/09/2026 12h32 s'est termine sans qu'on puisse dire si
+    # l'interlocuteur avait raccroche, si la branche SIP etait tombee ou si
+    # l'agent avait ferme la room : rien ne tracait le depart des participants
+    # ni le motif de deconnexion. On les nomme desormais.
+    @ctx.room.on("participant_disconnected")
+    def _on_participant_disconnected(p):
+        try:
+            motif = getattr(getattr(p, "_info", None), "disconnect_reason", None)
+            logger.info("Participant parti : %s (identite=%s, motif=%s)",
+                        getattr(p, "name", "?"), getattr(p, "identity", "?"), motif)
+        except Exception:  # noqa: BLE001
+            logger.exception("trace participant_disconnected")
+
+    @ctx.room.on("disconnected")
+    def _on_room_disconnected(*args):
+        logger.info("Room deconnectee (motif=%s)", args[0] if args else "?")
+
+    @ctx.room.on("reconnecting")
+    def _on_room_reconnecting(*_):
+        logger.warning("Reconnexion a la room en cours (lien LiveKit instable)")
+
     # --- Relance puis raccrochage sur silence prolongé -------------------
     # On arme un minuteur quand l'agent repasse en écoute ; on l'annule dès que
     # l'utilisateur reparle. Après INACTIVITY_TIMEOUT de silence on relance une
@@ -647,6 +709,8 @@ CONTEXTE DE CET APPEL (SORTANT) :
             except (asyncio.TimeoutError, Exception):  # noqa: BLE001
                 pass
             await asyncio.sleep(0.3)  # marge réseau dernier paquet audio
+            logger.info("Raccrochage a notre initiative : suppression de la room %s",
+                        ctx.room.name)
             await ctx.api.room.delete_room(api.DeleteRoomRequest(room=ctx.room.name))
         except Exception:  # noqa: BLE001
             logger.exception("Échec de la suppression de room, arrêt du job à la place")
@@ -757,7 +821,17 @@ CONTEXTE DE CET APPEL (SORTANT) :
     def _on_tool_execution(ev):
         nonlocal outils_en_cours
         try:
-            type_maj = getattr(getattr(ev, "update", None), "type", "")
+            maj = getattr(ev, "update", None)
+            type_maj = getattr(maj, "type", "")
+            # Nommer l'outil : sans cela, impossible de savoir apres coup si
+            # c'est le modele qui a raccroche (end_call) ou la ligne qui est
+            # tombee. Constat du 02/09/2026 sur l'appel coupe de 12h32.
+            nom_outil = (getattr(maj, "name", None)
+                         or getattr(getattr(maj, "function_call", None), "name", None)
+                         or getattr(getattr(maj, "tool_call", None), "name", None)
+                         or "?")
+            if type_maj in ("tool_call_started", "tool_call_ended"):
+                logger.info("Outil %s : %s", type_maj.replace("tool_call_", ""), nom_outil)
             if type_maj == "tool_call_started":
                 outils_en_cours += 1
                 _cancel_inactivity()

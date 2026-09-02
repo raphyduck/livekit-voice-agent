@@ -562,6 +562,11 @@ async def end_call() -> str:
             await asyncio.sleep(2.0)
         # petite marge pour la latence réseau du dernier paquet audio
         await asyncio.sleep(0.3)
+        # Tracer : c'est le MODELE qui decide de raccrocher ici. Sans cette
+        # ligne on ne pouvait pas distinguer, apres coup, un raccrochage decide
+        # par l'agent d'une ligne tombee (appel coupe du 02/09/2026 12h32).
+        logger.info("end_call : raccrochage demande par le modele, suppression de la room %s",
+                    ctx.room.name)
         await ctx.api.room.delete_room(api.DeleteRoomRequest(room=ctx.room.name))
         return "Appel terminé."
     except Exception as e:  # noqa: BLE001
