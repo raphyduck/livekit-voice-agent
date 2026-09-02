@@ -14,6 +14,7 @@ from livekit.agents import (
     Agent, AgentSession, EndpointingOptions, RoomInputOptions, RoomOutputOptions,
     TurnHandlingOptions, inference, mcp, metrics,
 )
+from livekit.agents.types import APIConnectOptions
 from livekit.agents.voice.turn import InterruptionOptions, PreemptiveGenerationOptions
 from livekit.plugins import (
     anthropic, cartesia, deepgram, noise_cancellation, openai, silero,
@@ -88,6 +89,29 @@ class _Claude5LLM(anthropic.LLM):
         return super().chat(extra_kwargs=extra, **kwargs)
 
 
+class _InferenceLLM(inference.LLM):
+    """LiveKit Inference avec un delai d'attente court et une reprise rapide.
+
+    Constat du 02/09/2026 (appel de 12h32) : une requete au gateway est restee
+    muette, aucun token n'est arrive. Le defaut du SDK est
+    APIConnectOptions(timeout=10 s, retry_interval=2 s) : la requete bloquee
+    tenait donc bien au-dela des 5 s que le framework accorde a une prise de
+    parole interrompue, et la parole a ete annulee (« speech not done in time
+    after interruption »). Resultat au telephone : cinq secondes de blanc, puis
+    « Allo ? » de l'interlocuteur.
+
+    Avec un TTFT mesure entre 0,33 et 0,51 s, 3 s sont six fois la normale :
+    seul un vrai blocage declenche le delai, et la reprise (0,2 s + un nouveau
+    TTFT) redonne la parole avant la limite des 5 s, sans blanc perceptible.
+    """
+
+    _CONN = APIConnectOptions(max_retry=3, retry_interval=0.2, timeout=3.0)
+
+    def chat(self, **kwargs):
+        kwargs.setdefault("conn_options", self._CONN)
+        return super().chat(**kwargs)
+
+
 def _make_llm(model: str):
     """Construit le LLM de l'appel, chez Anthropic ou via la passerelle LiteLLM.
 
@@ -99,7 +123,7 @@ def _make_llm(model: str):
         # Modeles heberges LiveKit Inference (ex. google/gemma-4-31b-it) :
         # gateway OpenAI-compatible de LiveKit Cloud, jeton minté automatiquement
         # depuis LIVEKIT_API_KEY/SECRET — aucun compte fournisseur ni passerelle.
-        return inference.LLM(model=model, extra_kwargs={"temperature": 0.6})
+        return _InferenceLLM(model=model, extra_kwargs={"temperature": 0.6})
     if not model.startswith("claude"):
         base = os.environ.get("LITELLM_URL", "http://127.0.0.1:4000/v1")
         cle = os.environ.get("LITELLM_KEY", "")
@@ -530,6 +554,13 @@ CONTEXTE DE CET APPEL (SORTANT) :
                 return
             qui = "Agent" if role == "assistant" else "Interlocuteur"
             live_transcript.append(f"{qui}: {txt}")
+            # Les tours de l'interlocuteur sont deja tracés plus bas
+            # (« Transcription (interlocuteur) »), mais rien ne disait ce que
+            # l'agent avait REPONDU : sur un appel entrant, que le journal ne
+            # couvre pas, il etait impossible de relire la conversation apres
+            # coup (constat du 02/09/2026 en debuggant l'appel de 12h32).
+            if role == "assistant":
+                logger.info("Transcription (agent): %s", txt)
             nonlocal_attente = _MOTIFS_ATTENTE.search(txt or "") is not None
             if role == "assistant":
                 _set_attente_promise(nonlocal_attente)
